@@ -1,0 +1,9 @@
+function(pk_add_test name)
+  add_executable(${name} ${name}.cpp)
+  target_link_libraries(${name} PRIVATE parakeet)
+  target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  add_test(NAME ${name} COMMAND ${name})
+  set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
+endfunction()
+
+pk_add_test(test_smoke)
