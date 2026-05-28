@@ -8,18 +8,20 @@
 namespace pk {
 
 // Copy a tensor loaded from the GGUF (lives in the loader context) into a new
-// tensor inside the compute context `ctx`, preserving its ne[] layout and f32
-// data. Weights in the GGUF have ggml ne = reverse of the torch shape, which is
-// exactly the layout ggml's conv kernels expect ([KW,KH,IC,OC]).
+// tensor inside the compute context `ctx`, preserving its ne[] layout, type, and
+// raw data. Weights in the GGUF have ggml ne = reverse of the torch shape, which
+// is exactly the layout ggml's conv kernels expect ([KW,KH,IC,OC]). The conv
+// kernels here stay F32 (the converter never quantizes them, and ggml_conv_2d
+// has no quantized path); only the final out.weight projection is allowlisted
+// and may be f16/q8_0, fed straight into ggml_mul_mat which dequantizes src0.
 static ggml_tensor* clone_weight(ggml_context* ctx, const ModelLoader& ml,
                                  const char* name) {
     ggml_tensor* src = ml.tensor(name);
     assert(src && "missing tensor");
-    assert(src->type == GGML_TYPE_F32 && "expected f32 weight");
     const int nd = ggml_n_dims(src);
     int64_t ne[4] = {1,1,1,1};
     for (int i = 0; i < nd; ++i) ne[i] = src->ne[i];
-    ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_F32, nd, ne);
+    ggml_tensor* dst = ggml_new_tensor(ctx, src->type, nd, ne);
     std::memcpy(dst->data, src->data, ggml_nbytes(src));
     return dst;
 }

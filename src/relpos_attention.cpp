@@ -10,16 +10,19 @@
 namespace pk {
 
 // Clone a tensor from the loader context into the compute context, preserving
-// ne[] layout and f32 data (same helper pattern as subsampling.cpp).
+// ne[] layout, type, and raw data (same helper pattern as subsampling.cpp).
+// Allowlisted attention linears (linear_q/k/v/out/pos.weight) may be stored f16
+// or q8_0 and are fed straight into ggml_mul_mat, which dequantizes src0 on the
+// fly; clone in the SAME type and copy raw bytes. pos_bias_u/v and every other
+// weight stay F32, for which this is identical to a plain f32 copy.
 static ggml_tensor* clone_weight(ggml_context* ctx, const ModelLoader& ml,
                                  const std::string& name) {
     ggml_tensor* src = ml.tensor(name);
     assert(src && "missing tensor");
-    assert(src->type == GGML_TYPE_F32 && "expected f32 weight");
     const int nd = ggml_n_dims(src);
     int64_t ne[4] = {1, 1, 1, 1};
     for (int i = 0; i < nd; ++i) ne[i] = src->ne[i];
-    ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_F32, nd, ne);
+    ggml_tensor* dst = ggml_new_tensor(ctx, src->type, nd, ne);
     std::memcpy(dst->data, src->data, ggml_nbytes(src));
     return dst;
 }

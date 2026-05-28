@@ -10,16 +10,20 @@ namespace pk {
 
 namespace {
 
-// Copy an f32 weight tensor from the model loader into the compute context.
-// Supports 1-D and 2-D weights; returns a contiguous ggml tensor.
+// Copy a weight tensor from the model loader into the compute context,
+// preserving its type and raw bytes. Supports 1-D and 2-D weights; returns a
+// contiguous ggml tensor. The joint enc/pred PROJECTION weights are on the
+// converter's quantization allowlist and may be stored f16/q8_0 -- they are fed
+// straight into ggml_mul_mat below, which dequantizes src0 on the fly. (The
+// joint OUTPUT projection joint.joint_net.2.weight is read as a raw float* in
+// forward() and is intentionally kept F32 by the converter.)
 static ggml_tensor* clone_w(ggml_context* ctx, const ModelLoader& ml, const char* name) {
     ggml_tensor* src = ml.tensor(name);
     assert(src && "missing joint tensor");
-    assert(src->type == GGML_TYPE_F32 && "joint tensor not f32");
     const int nd = ggml_n_dims(src);
     int64_t ne[4] = {1, 1, 1, 1};
     for (int i = 0; i < nd; ++i) ne[i] = src->ne[i];
-    ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_F32, nd, ne);
+    ggml_tensor* dst = ggml_new_tensor(ctx, src->type, nd, ne);
     std::memcpy(dst->data, src->data, ggml_nbytes(src));
     return dst;
 }
