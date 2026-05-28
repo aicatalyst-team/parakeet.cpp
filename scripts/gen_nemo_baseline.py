@@ -33,6 +33,44 @@ Stored tensors (squeezed; f32 except the int32 ids). Axis order documented in
 * ``ctc_logits``      ``[T', V+1]``        log-probs from ``m.ctc_decoder``
 * ``ctc_argmax_ids``  ``[T']`` int32       argmax over the vocab axis of logits
 
+Transducer-core ground truth (Phase 2; ``m.decoder`` = ``RNNTDecoder``
+prediction net, ``m.joint`` = ``RNNTJoint`` TDT joint):
+
+* ``pred_input_ids``  ``[U]`` int32        fixed label sequence fed to the
+                                           prediction net (``[120, 7, 300, 42]``,
+                                           all non-blank; blank=1024).
+* ``pred_out``        ``[U+1, pred_hidden=640]``  output ``g`` of
+                                           ``m.decoder.predict(y, add_sos=True)``,
+                                           squeezed. **add_sos=True** so a zero
+                                           "start-of-sequence" embedding step is
+                                           PREPENDED: with U=4 input ids the
+                                           output length is U+1 = 5. The SOS step
+                                           uses the zero embedding row
+                                           (``embed.weight[1024]`` is all-zero,
+                                           ``padding_idx=blank=1024``). The C++
+                                           prediction net MUST also prepend the
+                                           SOS step to match.
+* ``joint_out``       ``[N, U+1, 1030]``   RAW logits from
+                                           ``m.joint.joint(enc_slice, pred_out)``
+                                           with N = ``joint_enc_frames`` = 4
+                                           leading encoder frames. **RAW logits,
+                                           NOT log_softmax**: ``m.joint.joint`` on
+                                           CPU defaults to applying
+                                           ``log_softmax`` over all 1030 entries
+                                           (``log_softmax`` cfg is ``None``), but
+                                           the TDT greedy decoder consumes raw
+                                           logits and splits them — token logits
+                                           ``[:1025]`` (1024 vocab + blank) and
+                                           duration logits ``[1025:]`` (the 5 TDT
+                                           durations [0,1,2,3,4]) get SEPARATE
+                                           log_softmaxes. So we force
+                                           ``m.joint.log_softmax = False`` to dump
+                                           the raw output that the C++ joint
+                                           (plain ReLU + linear) produces.
+* ``joint_enc_frames`` ``[1]`` int32       N = number of leading encoder frames
+                                           used for ``joint_out`` (= 4). The C++
+                                           joint test feeds ``encoder_out[:, :N]``.
+
 String KVs:
 
 * ``baseline.detok_text``  detokenized text for the ``detok_ids`` fixture
@@ -225,6 +263,59 @@ def main():
     logits = _squeeze(cap["ctc_logits"])  # [T', V+1]
     ids = (logits.argmax(-1) if logits.ndim == 2 else logits.argmax(0)).astype(np.int32)
 
+    # ---- Transducer-core ground truth (Phase 2): prediction net + joint ----
+    # Done BEFORE change_decoding_strategy() (which only swaps the decoding
+    # strategy, not module weights, but we keep the model untouched to be safe).
+    #
+    # Prediction net: m.decoder.predict(y, state, add_sos, batch_size) returns
+    # (g, hidden). With add_sos=True (the predict() default and what the RNNT/TDT
+    # decoders use to prime the network), a zero "start-of-sequence" embedding
+    # step is PREPENDED, so g is [B, U+1, pred_hidden]. blank=1024 is the
+    # padding_idx so embed.weight[1024] is all-zero (== the SOS embedding).
+    pred_input_ids = np.array([120, 7, 300, 42], dtype=np.int32)  # all non-blank
+    add_sos = True
+    y = torch.from_numpy(pred_input_ids.astype(np.int64)).unsqueeze(0)  # [1, U]
+    with torch.no_grad():
+        g, _hid = m.decoder.predict(y, state=None, add_sos=add_sos, batch_size=None)
+    cap["pred_out"] = g.detach().cpu().float().numpy()  # [1, U+1, pred_hidden]
+
+    # Sanity: SOS step (g row 0) uses the zero embedding -> confirm embed[blank]
+    # is all-zero so the C++ side can reproduce the SOS step exactly.
+    embed_w = m.decoder.prediction["embed"].weight.detach()
+    blank_idx = int(getattr(m.decoder, "blank_idx", embed_w.shape[0] - 1))
+    sos_embed_is_zero = bool(torch.all(embed_w[blank_idx] == 0).item())
+    if not sos_embed_is_zero:  # pragma: no cover - layout guard
+        print(
+            f"PARAKEET_BASELINE_WARN: embed.weight[{blank_idx}] (SOS/padding) is "
+            f"NOT all-zero (absmax={float(embed_w[blank_idx].abs().max())}); the "
+            f"C++ SOS step must use this exact embedding row.",
+            file=sys.stderr,
+        )
+
+    # Joint: m.joint.joint(f, g) with f=[B,T,enc_hidden], g=[B,U,pred_hidden] ->
+    # [B, T, U, vocab+1+num_durations]=[B,T,U,1030]. `enc` from the encoder above
+    # is [B, d_model, T'] so transpose to [B, T', d_model] first. Slice to the
+    # first N=joint_enc_frames encoder frames to keep the dump small.
+    #
+    # RAW LOGITS: m.joint.joint() on CPU applies log_softmax over all 1030 entries
+    # by default (joint.log_softmax cfg is None). But the TDT greedy decoder uses
+    # RAW logits and splits them — token logits [:1025] and the 5 duration logits
+    # [1025:] get SEPARATE log_softmaxes. The C++ joint emits raw logits, so we
+    # force log_softmax=False here to dump the matching raw output.
+    joint_enc_frames = 4
+    enc_btd = enc.transpose(1, 2)  # [B, T', d_model]
+    n_frames = min(joint_enc_frames, enc_btd.shape[1])
+    enc_slice = enc_btd[:, :n_frames, :].contiguous()  # [1, N, enc_hidden]
+    saved_log_softmax = m.joint.log_softmax
+    try:
+        m.joint.log_softmax = False  # raw logits, matching the C++ joint
+        with torch.no_grad():
+            jout = m.joint.joint(enc_slice, g)  # [1, N, U+1, 1030] raw logits
+    finally:
+        m.joint.log_softmax = saved_log_softmax
+    cap["joint_out"] = jout.detach().cpu().float().numpy()  # [1, N, U+1, 1030]
+    joint_enc_frames_arr = np.array([n_frames], dtype=np.int32)
+
     # Tokenizer detok fixture: a small hand-picked set of regular BPE ids
     # (avoid id=0 <unk> and blank_id=1024 which is beyond vocab).
     detok_ids = np.array([10, 25, 100, 3, 7], dtype=np.int32)
@@ -250,6 +341,8 @@ def main():
         w.add_tensor(k, _squeeze(v))
     w.add_tensor("ctc_argmax_ids", np.ascontiguousarray(ids))
     w.add_tensor("detok_ids", detok_ids)
+    w.add_tensor("pred_input_ids", np.ascontiguousarray(pred_input_ids))
+    w.add_tensor("joint_enc_frames", np.ascontiguousarray(joint_enc_frames_arr))
     w.add_string("baseline.detok_text", detok_text)
     w.add_string("baseline.ctc_text", ctc_text)
     w.write_header_to_file()
@@ -260,9 +353,16 @@ def main():
     shapes = {k: tuple(_squeeze(v).shape) for k, v in cap.items()}
     shapes["ctc_argmax_ids"] = tuple(ids.shape)
     shapes["detok_ids"] = tuple(detok_ids.shape)
+    shapes["pred_input_ids"] = tuple(pred_input_ids.shape)
+    shapes["joint_enc_frames"] = tuple(joint_enc_frames_arr.shape)
     print("baseline tensors:", shapes)
     print(f"baseline.detok_text: {repr(detok_text)}")
     print(f"baseline.ctc_text: {repr(ctc_text)}")
+    print(
+        f"transducer: pred_input_ids={pred_input_ids.tolist()} add_sos={add_sos} "
+        f"U+1={shapes['pred_out'][0]} sos_embed_zero={sos_embed_is_zero} "
+        f"joint raw_logits=True joint_enc_frames={n_frames}"
+    )
     print(f"wrote {args.output}: tensors={len(shapes)} (dither=0.0, explicit forward)")
 
 

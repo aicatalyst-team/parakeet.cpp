@@ -61,6 +61,11 @@ required = [
     "encoder_out",
     "ctc_logits",
     "ctc_argmax_ids",
+    # Phase 2 transducer core: prediction net + joint ground truth.
+    "pred_input_ids",
+    "pred_out",
+    "joint_out",
+    "joint_enc_frames",
 ]
 for req in required:
     assert req in names, f"missing baseline tensor {req}"

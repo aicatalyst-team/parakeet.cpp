@@ -157,3 +157,44 @@ out). Shapes below are for the committed fixture on `parakeet-tdt_ctc-110m`.
 | `encoder_out` | `m.encoder` (element 0, post-transpose) | `[d_model, T']` | `[512, 26]` |
 | `ctc_logits` | `m.ctc_decoder` (log-softmax) | `[T', V+1]` | `[26, 1025]` |
 | `ctc_argmax_ids` | argmax of `ctc_logits` over vocab axis | `[T']` int32 | `[26]` |
+
+### Transducer-core intermediates (Phase 2)
+
+Ground truth for the RNN-Transducer prediction net (`m.decoder`,
+`RNNTDecoder`) and joint net (`m.joint`, `RNNTJoint` TDT joint), so the C++
+`pk::PredictionNet` and `pk::Joint` can be diffed against NeMo. Dumped from the
+same `eval()` / `torch.no_grad()` run as above.
+
+| Tensor | Source | Axis order | Example shape |
+|---|---|---|---|
+| `pred_input_ids` | fixed label seq `[120, 7, 300, 42]` (all non-blank) | `[U]` int32 | `[4]` |
+| `pred_out` | `m.decoder.predict(y, add_sos=True)` output `g` | `[U+1, pred_hidden]` | `[5, 640]` |
+| `joint_out` | `m.joint.joint(enc_slice, pred_out)` **raw logits** | `[N, U+1, V+1+durations]` | `[4, 5, 1030]` |
+| `joint_enc_frames` | N = leading encoder frames used for `joint_out` | `[1]` int32 | `[4]` |
+
+**`add_sos` (prediction net).** `m.decoder.predict(y, state=None, add_sos=True,
+batch_size=None)` returns `(g, hidden)`. `add_sos=True` (the `predict()` default,
+and what NeMo's RNNT/TDT decoders use to prime the network) **prepends a zero
+"start-of-sequence" embedding step**, so for `U=4` input ids the output `g` has
+length `U+1 = 5`. The SOS step uses the zero embedding row
+`decoder.prediction.embed.weight[1024]` (`padding_idx = blank = 1024`), which is
+verified all-zero at dump time (a warning is printed if it ever is not). **The
+C++ prediction net must also prepend the SOS step** to match `pred_out`'s length
+and row 0.
+
+**Raw logits vs log_softmax (joint net).** `m.joint.joint(f, g)` takes
+`f = [B, T, enc_hidden]` and `g = [B, U, pred_hidden]` and returns
+`[B, T, U, 1030]` where `1030 = 1024 vocab + 1 blank + 5 TDT durations`. On CPU
+the joint's `log_softmax` config is `None`, so by default `joint.joint` would
+apply `log_softmax` over **all 1030** entries. That is **not** what the TDT
+greedy decoder consumes: it uses the **raw logits** and splits them into token
+logits `[..., :1025]` (1024 vocab + blank) and duration logits `[..., 1025:]`
+(the 5 durations `[0,1,2,3,4]`), applying **separate** log_softmaxes to each
+split. The C++ joint emits plain (ReLU + linear) raw logits, so the dumper forces
+`m.joint.log_softmax = False` and stores **raw logits** in `joint_out`. The
+token/duration split point is `vocab+1 = 1025`.
+
+**Encoder slice.** The real encoder output `enc` (`[B, d_model, T']`) is
+transposed to `[B, T', d_model]` and sliced to the first `N = joint_enc_frames =
+4` frames before being fed to the joint, keeping `joint_out` small. The C++ joint
+test feeds `encoder_out[:, :N]` to match.
