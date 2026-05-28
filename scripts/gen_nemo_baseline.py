@@ -111,6 +111,7 @@ normal offline forward already applies limited-context + causal + layer_norm):
 Exit codes (ctest convention): 0 = ok, 2 = deps/model unavailable, 1 = fail.
 """
 import argparse
+import json
 import pathlib
 import sys
 import warnings
@@ -143,12 +144,253 @@ def _squeeze(arr):
     return np.ascontiguousarray(out)
 
 
+def _timestamps_decoding_cfg(m):
+    """Build a decoding cfg (cloned from the model's own) that turns on
+    per-frame/token/word confidence using the reproducible ``max_prob`` method.
+
+    NeMo's ``max_prob`` is NOT the raw softmax probability: it is the *rescaled*
+    confidence ``(p_max * V - 1) / (V - 1)`` (with ``alpha == 1.0``), where
+    ``p_max = exp(max log-prob)`` and ``V`` is the vocab size (see
+    ``asr_confidence_utils.get_confidence_measure_bank``). We dump NeMo's actual
+    confidence values so the C++ side can reproduce *that* mapping.
+
+    ``aggregation='min'`` (NeMo default) -> per-word confidence is the MIN of its
+    tokens' confidences.
+    """
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.create(OmegaConf.to_container(m.cfg.decoding, resolve=True))
+    cfg.confidence_cfg = {
+        "preserve_frame_confidence": True,
+        "preserve_token_confidence": True,
+        "preserve_word_confidence": True,
+        "exclude_blank": True,
+        "aggregation": "min",
+        "method_cfg": {"name": "max_prob"},
+    }
+    return cfg
+
+
+def _dump_head_timestamps(m, audio, decoder_type, blank_id):
+    """Run one decoding head with timestamps+confidence and extract the per-token
+    ``{id, frame, conf}`` arrays plus the per-word ``{w, start, end, conf}`` list.
+
+    Returns (token_ids[int32], token_frames[int32], token_conf[f32], words[list],
+             text, token_duration_or_None).
+
+    Token-id sourcing differs by head:
+      * RNNT/TDT: ``hyp.y_sequence`` IS the emitted token-id sequence.
+      * CTC: ``hyp.y_sequence`` holds per-frame LOG-PROBS (shape ``[T, V+1]``) when
+        timestamps/alignments are on, NOT ids. We reconstruct the ids exactly the
+        way NeMo's CTC greedy does: argmax over the vocab axis, collapse repeats,
+        drop blanks. This yields a sequence that aligns 1:1 with ``timestamp['char']``
+        and ``token_confidence`` and detokenizes to ``hyp.text``.
+
+    The per-token encoder frame is ``timestamp['char'][i]['start_offset']`` (the
+    frame index where the token was emitted) for BOTH heads.
+    """
+    import torch
+
+    m.change_decoding_strategy(_timestamps_decoding_cfg(m), decoder_type=decoder_type)
+    with torch.no_grad():
+        out = m.transcribe([audio], batch_size=1, timestamps=True, return_hypotheses=True)
+    hyp = (out[0] if isinstance(out, tuple) else out)[0]
+
+    char_offsets = hyp.timestamp["char"]
+    token_frames = np.array(
+        [int(c["start_offset"]) for c in char_offsets], dtype=np.int32
+    )
+    token_conf = np.array([float(x) for x in hyp.token_confidence], dtype=np.float32)
+
+    if decoder_type == "ctc":
+        logits = np.asarray(hyp.y_sequence)  # [T, V+1] log-probs
+        am = logits.argmax(-1)
+        collapsed = []
+        prev = -1
+        for x in am.tolist():
+            if x != prev:
+                collapsed.append(x)
+            prev = x
+        token_ids = np.array(
+            [x for x in collapsed if x != blank_id], dtype=np.int32
+        )
+        token_duration = None
+    else:
+        ys = hyp.y_sequence
+        ys = ys.cpu().tolist() if hasattr(ys, "cpu") else list(ys)
+        token_ids = np.array(list(ys), dtype=np.int32)
+        td = getattr(hyp, "token_duration", None)
+        if td is not None:
+            token_duration = [int(x) for x in (td.tolist() if hasattr(td, "tolist") else td)]
+        else:
+            token_duration = None
+
+    word_offsets = hyp.timestamp["word"]
+    word_conf = [float(x) for x in hyp.word_confidence]
+    if len(word_conf) != len(word_offsets):
+        raise RuntimeError(
+            f"baseline: {decoder_type} word_confidence ({len(word_conf)}) != "
+            f"word_offsets ({len(word_offsets)})"
+        )
+    words = []
+    for wo, wc in zip(word_offsets, word_conf):
+        words.append(
+            {
+                "w": wo["word"],
+                "start": round(float(wo["start"]), 6),
+                "end": round(float(wo["end"]), 6),
+                "conf": round(float(wc), 6),
+            }
+        )
+
+    return token_ids, token_frames, token_conf, words, hyp.text, token_duration
+
+
+def _run_timestamps(m, args):
+    """``--timestamps`` mode: dump per-token + per-word timestamps and max_prob
+    confidence for BOTH heads (TDT/RNNT + CTC) of the hybrid anchor model.
+
+    Existing baseline dumper modes are untouched; this is a separate early path.
+    """
+    has_ctc = getattr(m, "ctc_decoder", None) is not None
+    has_rnnt = getattr(m, "joint", None) is not None
+    if not (has_ctc and has_rnnt):
+        print(
+            "PARAKEET_BASELINE_TS_NOT_HYBRID: --timestamps expects a hybrid "
+            f"(CTC + TDT/RNNT) model; got has_ctc={has_ctc} has_rnnt={has_rnnt}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    blank_id = int(
+        getattr(getattr(m, "decoder", None), "blank_idx", None)
+        or getattr(m.tokenizer, "vocab_size", 1024)
+    )
+
+    window_stride = float(m.cfg.preprocessor.window_stride)
+    subsampling_factor = int(m.cfg.encoder.get("subsampling_factor", 8))
+    frame_sec = window_stride * subsampling_factor  # 0.01 * 8 = 0.08 s/frame
+    clip_sec = None
+
+    # ---- TDT / transducer head ----
+    (tdt_ids, tdt_frames, tdt_conf, tdt_words, tdt_text, tdt_dur) = _dump_head_timestamps(
+        m, args.audio, "rnnt", blank_id
+    )
+    # ---- CTC head ----
+    (ctc_ids, ctc_frames, ctc_conf, ctc_words, ctc_text, _ctc_dur) = _dump_head_timestamps(
+        m, args.audio, "ctc", blank_id
+    )
+
+    # ---- Verification (fail loudly so a broken baseline is never written) ----
+    def _verify(tag, ids, frames, conf, words, text):
+        if not (len(ids) == len(frames) == len(conf)):
+            raise RuntimeError(
+                f"baseline[{tag}]: per-token arrays length mismatch: ids={len(ids)} "
+                f"frames={len(frames)} conf={len(conf)}"
+            )
+        if len(frames) and not all(
+            frames[i] <= frames[i + 1] for i in range(len(frames) - 1)
+        ):
+            raise RuntimeError(f"baseline[{tag}]: token frames not monotonic non-decreasing")
+        if len(conf) and not all(0.0 < float(c) <= 1.0 + 1e-6 for c in conf):
+            raise RuntimeError(f"baseline[{tag}]: token confidences not in (0, 1]")
+        # word texts concatenate to the transcript
+        joined = " ".join(w["w"] for w in words)
+        if joined.split() != text.split():
+            raise RuntimeError(
+                f"baseline[{tag}]: word texts do not reconstruct transcript:\n"
+                f"  words: {joined!r}\n  text:  {text!r}"
+            )
+        # word times sane: increasing starts, end>=start, within clip
+        last = -1.0
+        for w in words:
+            if not (w["start"] >= last - 1e-6 and w["end"] >= w["start"] - 1e-6):
+                raise RuntimeError(f"baseline[{tag}]: word times not sane: {w}")
+            last = w["start"]
+        # detok of ids == transcript
+        detok = m.tokenizer.ids_to_text([int(i) for i in ids.tolist()])
+        if detok != text:
+            raise RuntimeError(
+                f"baseline[{tag}]: detok(ids) != transcript:\n"
+                f"  detok: {detok!r}\n  text:  {text!r}"
+            )
+
+    _verify("tdt", tdt_ids, tdt_frames, tdt_conf, tdt_words, tdt_text)
+    _verify("ctc", ctc_ids, ctc_frames, ctc_conf, ctc_words, ctc_text)
+
+    # frames must fit within the clip duration
+    import soundfile as sf
+
+    info = sf.info(args.audio)
+    clip_sec = info.frames / info.samplerate
+    for tag, frames in (("tdt", tdt_frames), ("ctc", ctc_frames)):
+        if len(frames) and float(frames[-1]) * frame_sec > clip_sec + 1.0:
+            raise RuntimeError(
+                f"baseline[{tag}]: last token frame {frames[-1]} (>{frames[-1]*frame_sec:.2f}s) "
+                f"exceeds clip duration {clip_sec:.2f}s"
+            )
+
+    # ---- Write the GGUF baseline ----
+    w = gguf.GGUFWriter(args.output, "parakeet-baseline-ts")
+    w.add_float32("baseline.frame_sec", float(frame_sec))
+    w.add_uint32("baseline.subsampling_factor", int(subsampling_factor))
+
+    w.add_tensor("ts_tdt_token_ids", np.ascontiguousarray(tdt_ids))
+    w.add_tensor("ts_tdt_token_frames", np.ascontiguousarray(tdt_frames))
+    w.add_tensor("ts_tdt_token_conf", np.ascontiguousarray(tdt_conf))
+    w.add_string("baseline.tdt_words_json", json.dumps(tdt_words, ensure_ascii=False))
+    w.add_string("baseline.tdt_text", tdt_text)
+
+    w.add_tensor("ts_ctc_token_ids", np.ascontiguousarray(ctc_ids))
+    w.add_tensor("ts_ctc_token_frames", np.ascontiguousarray(ctc_frames))
+    w.add_tensor("ts_ctc_token_conf", np.ascontiguousarray(ctc_conf))
+    w.add_string("baseline.ctc_words_json", json.dumps(ctc_words, ensure_ascii=False))
+    w.add_string("baseline.ctc_text", ctc_text)
+
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+    # ---- Summary ----
+    def _summary(tag, ids, frames, conf, words, dur):
+        print(f"--- {tag} head ---")
+        print(f"  tokens: {len(ids)}  (frame_sec={frame_sec:.3f}s, clip={clip_sec:.2f}s)")
+        print(f"  first 6 token ids:    {ids[:6].tolist()}")
+        print(f"  first 6 token frames: {frames[:6].tolist()}")
+        print(f"  first 6 token conf:   {[round(float(c),4) for c in conf[:6]]}")
+        if dur is not None:
+            print(f"  first 6 token durs:   {dur[:6]}")
+        print(f"  words: {len(words)}; first 5:")
+        for wd in words[:5]:
+            print(
+                f"    {wd['w']!r:14} start={wd['start']:.2f}s end={wd['end']:.2f}s "
+                f"conf={wd['conf']:.4f}"
+            )
+
+    print(f"baseline.frame_sec={frame_sec} subsampling_factor={subsampling_factor}")
+    _summary("TDT/RNNT", tdt_ids, tdt_frames, tdt_conf, tdt_words, tdt_dur)
+    _summary("CTC", ctc_ids, ctc_frames, ctc_conf, ctc_words, None)
+    print(f"baseline.tdt_text: {tdt_text!r}")
+    print(f"baseline.ctc_text: {ctc_text!r}")
+    print(
+        f"wrote {args.output}: timestamps+confidence baseline "
+        f"(max_prob, aggregation=min, dither=0.0)"
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="nvidia/parakeet-tdt_ctc-110m",
                     help="HF id or local .nemo")
     ap.add_argument("--audio", required=True, help="16k mono wav clip")
     ap.add_argument("--output", required=True)
+    ap.add_argument(
+        "--timestamps",
+        action="store_true",
+        help="dump per-token/word timestamps + max_prob confidence for both "
+        "heads (TDT/RNNT + CTC) instead of the encoder-stage baseline.",
+    )
     args = ap.parse_args()
 
     is_local = pathlib.Path(args.model).exists()
@@ -164,6 +406,13 @@ def main():
     m.eval()
     # Determinism: zero the spectrogram dither so the mel is reproducible.
     m.preprocessor.featurizer.dither = 0.0
+
+    # --timestamps: dump per-token/word timestamps + max_prob confidence for both
+    # heads, then return. Kept as a separate early path so the encoder-stage
+    # baseline behaviour below is completely untouched.
+    if args.timestamps:
+        _run_timestamps(m, args)
+        return
 
     # Per-layer / module captures via forward hooks. The preprocessor and
     # encoder return (tensor, length) tuples; conformer layers return a bare
