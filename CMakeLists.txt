@@ -27,7 +27,8 @@ set(PARAKEET_SRC
     src/audio_io.cpp
     src/model_loader.cpp
     src/ggml_graph.cpp
-    src/fft.cpp)
+    src/fft.cpp
+    src/mel.cpp)
 
 if(PARAKEET_SHARED)
   add_library(parakeet SHARED ${PARAKEET_SRC})

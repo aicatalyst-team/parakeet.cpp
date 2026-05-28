@@ -10,7 +10,10 @@ pk_add_test(test_smoke)
 pk_add_test(test_audio_io)
 pk_add_test(test_model_loader)
 pk_add_test(test_fft)
-set_tests_properties(test_model_loader PROPERTIES LABELS "model")
+pk_add_test(test_mel)
+set_tests_properties(test_model_loader test_mel PROPERTIES LABELS "model")
+# test_mel reads tests/fixtures/clip.wav via a path relative to the project root.
+set_tests_properties(test_mel PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Python converter check (skips with exit 77 when the venv/model are absent).
 find_program(PARAKEET_PY NAMES python3 HINTS ${CMAKE_SOURCE_DIR}/.venv/bin)
