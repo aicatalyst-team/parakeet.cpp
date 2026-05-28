@@ -1,0 +1,5 @@
+# wav_path	ref_text  # note: antirez_italian.wav is Italian — exercises multilingual tdt-0.6b-v3
+/home/mudler/_git/parakeet.cpp/benchmarks/audio/diverse/jfk.wav	And so my fellow Americans, ask not what your country can do for you, ask what you can do for your country.
+/home/mudler/_git/parakeet.cpp/benchmarks/audio/diverse/i_have_a_dream.wav	
+/home/mudler/_git/parakeet.cpp/benchmarks/audio/diverse/antirez_italian.wav	
+/home/mudler/_git/parakeet.cpp/benchmarks/audio/diverse/test_speech.wav	

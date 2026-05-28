@@ -6,3 +6,9 @@
 __pycache__/
 *.pyc
 /.cache/
+
+# Benchmark large/derived files (audio + model weights) — NOT committed
+benchmarks/audio/
+benchmarks/models/
+# Benchmark manifests ARE committed (small text, contain ground-truth refs)
+!benchmarks/*_manifest.tsv
