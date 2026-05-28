@@ -57,15 +57,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="HF id or local .nemo")
     ap.add_argument("--output", required=True)
-    ap.add_argument("--strict", action="store_true",
-                    help="error on tensors that look unexpected (reserved)")
     args = ap.parse_args()
 
     is_hf_id = "/" in args.model and not args.model.endswith(".nemo")
-    if is_hf_id:
-        m = ASRModel.from_pretrained(args.model, map_location="cpu")
-    else:
-        m = ASRModel.restore_from(args.model, map_location="cpu")
+    try:
+        if is_hf_id:
+            m = ASRModel.from_pretrained(args.model, map_location="cpu")
+        else:
+            m = ASRModel.restore_from(args.model, map_location="cpu")
+    except Exception as e:  # pragma: no cover - network/cache guard
+        print(f"PARAKEET_MODEL_UNAVAILABLE: {e}", file=sys.stderr)
+        sys.exit(2)
     m.eval()
 
     arch = detect_arch(m)

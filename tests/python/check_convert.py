@@ -32,10 +32,14 @@ r = subprocess.run(
 print(r.stdout, end="")
 print(r.stderr, end="", file=sys.stderr)
 
-# The converter exits 2 (and prints a marker) when NeMo/gguf are not installed.
-# CI without the reference venv must skip, not fail.
-if r.returncode == 2 or "PARAKEET_CONVERT_DEPS_MISSING" in r.stderr:
-    print("check_convert: converter dependencies missing; skipping", file=sys.stderr)
+# The converter exits 2 (and prints a marker) when NeMo/gguf are not installed,
+# or when the model checkpoint cannot be obtained (no network, HF 403, etc.).
+# CI without the reference venv or without model access must skip, not fail.
+if (r.returncode == 2
+        or "PARAKEET_CONVERT_DEPS_MISSING" in r.stderr
+        or "PARAKEET_MODEL_UNAVAILABLE" in r.stderr):
+    print("check_convert: converter dependencies or model unavailable; skipping",
+          file=sys.stderr)
     sys.exit(77)
 if r.returncode != 0:
     print("check_convert: converter failed", file=sys.stderr)
