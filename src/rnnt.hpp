@@ -44,4 +44,39 @@ std::vector<int32_t> rnnt_greedy(const PredictionNet& pred, const Joint& joint,
                                  const std::vector<float>& enc, int T, int enc_hidden,
                                  int blank_id, int max_symbols);
 
+// Carried RNN-T greedy decoding state, so the per-frame loop can be driven
+// INCREMENTALLY (the encoder frames arrive in chunks but the decoder must NOT
+// reset across chunk boundaries). This is exactly the loop-carried state of
+// rnnt_greedy lifted into a struct (NeMo partial_hypotheses): the committed
+// (non-blank) prediction-net LSTM state, the last emitted label + "have we
+// emitted yet" flag (== SOS handling), and the accumulated hypothesis.
+//
+// Feeding the encoder frames [0..T) split into chunks of any size, via repeated
+// rnnt_decode_frames calls on the SAME RnntDecodeState, produces the identical
+// token sequence as rnnt_greedy on the whole [0..T) at once — because the only
+// thing the frame loop carries across frames is exactly this struct, and the
+// per-frame inner emit-until-blank loop is independent of how the frames were
+// chunked.
+struct RnntDecodeState {
+    PredState state;          // committed prediction-net LSTM state (h,c per layer)
+    int32_t   last_token = -1; // last EMITTED token (-1 sentinel: nothing yet → SOS)
+    bool      have_token = false; // have we emitted any token (false → use SOS)
+    std::vector<int32_t> hyp;  // accumulated emitted token ids (across all chunks)
+};
+
+// Initialise a fresh decode state (zeroed prediction-net LSTM state, SOS).
+RnntDecodeState rnnt_decode_init(const PredictionNet& pred);
+
+// Run the RNN-T greedy frame loop over `Tnew` NEW encoder frames, carrying and
+// updating `st` (so subsequent calls continue from where this one left off).
+// enc_frames: row-major [Tnew, enc_hidden], enc_frames[t*enc_hidden + c].
+// Appends the newly emitted token ids to st.hyp AND returns the ids emitted in
+// THIS call (for the streaming "newly finalized tokens" API). The decoder state
+// (LSTM, last token, SOS flag) persists in `st` across calls.
+std::vector<int32_t> rnnt_decode_frames(const PredictionNet& pred, const Joint& joint,
+                                        const std::vector<float>& enc_frames,
+                                        int Tnew, int enc_hidden,
+                                        RnntDecodeState& st,
+                                        int blank_id, int max_symbols);
+
 } // namespace pk
