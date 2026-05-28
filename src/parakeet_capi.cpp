@@ -22,27 +22,60 @@ struct parakeet_ctx {
 };
 
 // The opaque streaming session: a pk::StreamingSession over the ctx's model plus
-// a PCM accumulation buffer.
+// an INCREMENTAL log-mel front end (pk::StreamingMel).
 //
-// `feed` accumulates 16 kHz mono PCM and incrementally decodes any encoder chunks
-// for which enough audio (and right context) is now buffered, carrying the
-// encoder/decoder caches across feeds — so a live consumer gets partial text as
-// audio arrives. The full-clip per-feature mel normalization (NeMo
-// online_normalization=False) means the mel is recomputed over the buffered PCM
-// each time a new chunk is decoded; committed chunks are not re-decoded.
+// `feed` turns the just-arrived 16 kHz mono PCM into the newly-ready mel frames
+// via StreamingMel (frame-local, NO full-buffer recompute — see mel.hpp), grows
+// the accumulated mel-frame buffer, then incrementally decodes any encoder
+// chunks for which enough mel frames (and right context) are now buffered,
+// carrying the encoder/decoder caches across feeds — so a live consumer gets
+// partial text as audio arrives. Committed chunks are not re-decoded.
 //
-// `finalize` flushes the streaming tail: it decodes the final (partial) chunk
-// with keep_all_outputs so the trailing encoder frames complete, then returns
-// any remaining text. It does NOT fabricate an <EOU> NeMo's streaming would not
-// emit.
+// The streaming model uses normalize="NA" (frame-local mel, no whole-utterance
+// stats), so the incremental mel is bit-identical to MelFrontend::compute on the
+// full clip (see tests/test_streaming_mel.cpp); only the accumulated mel frames
+// (NOT the raw PCM) are retained, and StreamingMel itself keeps only ~n_fft
+// recent samples.
+//
+// `finalize` appends StreamingMel's end zero-pad tail frames, then flushes the
+// streaming decoder tail: it decodes the final (partial) chunk with
+// keep_all_outputs so the trailing encoder frames complete, then returns any
+// remaining text. It does NOT fabricate an <EOU> NeMo's streaming would not emit.
 struct parakeet_stream {
     parakeet_ctx* ctx = nullptr;             // borrowed (must outlive the stream)
-    std::vector<float> pcm;                  // accumulated 16 kHz mono PCM
+    std::unique_ptr<pk::StreamingMel> mel;   // incremental log-mel front end
+    std::vector<float> mel_buf;              // accumulated mel [n_mels, mel_T] feat-major
+    int n_mels = 0;
+    int mel_T = 0;                           // total mel frames accumulated so far
     std::unique_ptr<pk::StreamingSession> sess;
     int mel_buffer_idx = 0;                  // next un-fed mel frame (chunk schedule)
     bool first_chunk = true;                 // chunk 0 has no pre-encode overlap
     bool finalized = false;
 };
+
+namespace {
+// Append `n_new` feat-major mel frames `[n_mels, n_new]` to the stream's
+// accumulated feat-major mel buffer `[n_mels, mel_T]`, growing mel_T. Both are
+// feat-major (out[m*T + t]); appending along the time axis requires a per-row
+// rebuild since the inner stride changes when T grows.
+void append_mel_frames(parakeet_stream* s, const std::vector<float>& frames, int n_new) {
+    if (n_new <= 0) return;
+    const int n_mels = s->n_mels;
+    const int old_T = s->mel_T;
+    const int new_T = old_T + n_new;
+    std::vector<float> out((size_t)n_mels * new_T);
+    for (int m = 0; m < n_mels; ++m) {
+        // copy existing [0, old_T)
+        for (int t = 0; t < old_T; ++t)
+            out[(size_t)m * new_T + t] = s->mel_buf[(size_t)m * old_T + t];
+        // append new [old_T, new_T)
+        for (int t = 0; t < n_new; ++t)
+            out[(size_t)m * new_T + (old_T + t)] = frames[(size_t)m * n_new + t];
+    }
+    s->mel_buf.swap(out);
+    s->mel_T = new_T;
+}
+} // namespace
 
 namespace {
 
@@ -139,22 +172,22 @@ extern "C" char* parakeet_capi_transcribe_pcm(parakeet_ctx* ctx, const float* sa
 
 namespace {
 
-// Compute the full-clip log-mel of the currently buffered PCM (NeMo
-// online_normalization=False reference: normalization over the whole buffer) and
-// feed any not-yet-fed encoder chunks for which enough mel frames are buffered,
-// carrying the StreamingSession caches. `flush` marks the final partial chunk
-// is_last (keep_all_outputs), draining the remaining frames. Sets *eou to 1 if
-// an <EOU>/<EOB> event fired in this pass. Returns the newly-finalized text.
+// Feed any not-yet-fed encoder chunks for which enough mel frames are now
+// buffered, carrying the StreamingSession caches. Operates over the stream's
+// INCREMENTALLY-accumulated mel buffer (s->mel_buf / s->mel_T) — the mel for
+// new PCM is produced frame-local by StreamingMel in the feed/finalize entry
+// points, NOT recomputed over the whole buffer here. `flush` marks the final
+// partial chunk is_last (keep_all_outputs), draining the remaining frames. Sets
+// *eou to 1 if an <EOU>/<EOB> event fired in this pass. Returns the newly-
+// finalized text.
 std::string feed_available(parakeet_stream* s, bool flush, int& eou_flag) {
     eou_flag = 0;
     pk::StreamingSession& sess = *s->sess;
-    const pk::ModelLoader& ml = s->ctx->model->loader();
 
-    pk::MelFrontend mel_fe(ml);
-    std::vector<float> mel;
-    int n_mels = 0, T = 0;
-    mel_fe.compute(s->pcm, mel, n_mels, T);
+    const int n_mels = s->n_mels;
+    const int T = s->mel_T;
     if (T <= 0) return std::string();
+    const std::vector<float>& mel = s->mel_buf;  // [n_mels, T] feat-major
 
     const int chunk0     = sess.chunk_size_first();
     const int chunk_main = sess.chunk_size();
@@ -214,6 +247,8 @@ extern "C" parakeet_stream* parakeet_capi_stream_begin(parakeet_ctx* ctx) {
         if (!s) { ctx->last_error = "out of memory"; return nullptr; }
         s->ctx = ctx;
         s->sess = std::make_unique<pk::StreamingSession>(ctx->model->loader());
+        s->mel  = std::make_unique<pk::StreamingMel>(ctx->model->loader());
+        s->n_mels = s->mel->n_mels();
         ctx->last_error.clear();
         return s;
     } catch (const std::exception& e) {
@@ -235,7 +270,14 @@ extern "C" char* parakeet_capi_stream_feed(parakeet_stream* s, const float* pcm,
         return nullptr;
     }
     try {
-        if (n_samples > 0) s->pcm.insert(s->pcm.end(), pcm, pcm + n_samples);
+        // Incremental, frame-local mel for the just-arrived PCM (no full-buffer
+        // recompute). StreamingMel carries the preemph history + partial frame
+        // across feeds; the emitted frames are appended to the accumulated mel.
+        if (n_samples > 0) {
+            int n_new = 0;
+            std::vector<float> frames = s->mel->feed(pcm, n_samples, n_new);
+            append_mel_frames(s, frames, n_new);
+        }
         int eou = 0;
         std::string delta = feed_available(s, /*flush=*/false, eou);
         if (eou_out) *eou_out = eou;
@@ -256,6 +298,13 @@ extern "C" char* parakeet_capi_stream_finalize(parakeet_stream* s) {
     if (!s) return nullptr;
     if (!s->ctx || !s->ctx->model) return nullptr;
     try {
+        // Emit the end zero-pad tail frames so the accumulated mel matches the
+        // full-buffer MelFrontend::compute exactly, then flush the decoder tail.
+        if (s->mel) {
+            int n_tail = 0;
+            std::vector<float> tail = s->mel->finalize(n_tail);
+            append_mel_frames(s, tail, n_tail);
+        }
         int eou = 0;
         std::string delta = feed_available(s, /*flush=*/true, eou);
         // After the flush the session's finalize() is a no-op text-wise (no extra
