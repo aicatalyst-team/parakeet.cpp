@@ -30,6 +30,7 @@ private:
     const ModelLoader& ml_;
     int conv_channels_;   // C
     int d_model_;         // out features
+    bool causal_ = false; // causal_downsampling: left-heavy conv padding (streaming)
 };
 
 } // namespace pk

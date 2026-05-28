@@ -36,6 +36,11 @@ private:
     int d_model_;
     int n_heads_;
     int d_head_;
+    // Chunked-limited attention (att_context_style=="chunked_limited"). When set,
+    // an extra additive -inf window mask is applied to the scores (see forward()).
+    bool chunked_limited_ = false;
+    int att_left_  = -1;   // att_context_size[0] (left limit in frames)
+    int att_right_ = -1;   // att_context_size[1] (right/lookahead in frames)
 };
 
 } // namespace pk

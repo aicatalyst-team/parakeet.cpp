@@ -30,16 +30,25 @@ Subsampling::Subsampling(const ModelLoader& ml)
     : ml_(ml) {
     conv_channels_ = (int)ml.config().subsampling_conv_channels;
     d_model_       = (int)ml.config().d_model;
+    causal_        = ml.config().causal_downsampling;
 }
 
 int Subsampling::valid_out_len(int T) const {
     // The mel has T spatial frames, but the preprocessor reports a valid length
     // of T-1 (center-padding adds one extra trailing frame). Each of the three
-    // stride-2, k=3, p=1 conv stages reduces the valid length via NeMo's
-    // calc_length: out = (in + 2*p - k)/s + 1.
+    // stride-2, k=3 conv stages reduces the valid length via NeMo's calc_length:
+    // out = floor((in + all_paddings - k)/s) + 1, where all_paddings = left+right.
+    //
+    // Non-causal (offline): symmetric pad (k-1)/2 each side -> all_paddings = 2.
+    //   out = floor((in + 2 - 3)/2) + 1 = (in - 1)/2 + 1  (matches existing path).
+    // Causal (causal_downsampling=True): left = k-1 = 2, right = stride-1 = 1 ->
+    //   all_paddings = 3.  out = floor((in + 3 - 3)/2) + 1 = floor(in/2) + 1.
+    // NeMo's calc_length runs in float; for these integer inputs floor matches
+    // integer division, so we use integer arithmetic directly.
+    const int all_paddings = causal_ ? 3 : 2;
     int valid = T - 1;
     for (int st = 0; st < 3; ++st)            // conv0, conv2, conv5
-        valid = (valid + 2 - 3) / 2 + 1;
+        valid = (valid + all_paddings - 3) / 2 + 1;
     return valid;
 }
 
@@ -77,11 +86,57 @@ void Subsampling::forward(const std::vector<float>& mel, int n_mels, int T,
                         xd[(size_t)t * F + f] = mel[(size_t)f * T + t];
             }
 
-            // ---- Stage 1: full Conv2d(1 -> C, k=3, s=2, p=1) + ReLU ----
+            // Subsampling conv padding. NeMo dw_striding uses k=3, s=2 on each
+            // stage; the padding differs by model:
+            //   non-causal (offline): symmetric (k-1)/2 = 1 on every side, applied
+            //     directly via the conv's p0/p1 (byte-identical to the old path).
+            //   causal (causal_downsampling=True, e.g. parakeet_realtime_eou_120m):
+            //     NeMo CausalConv2D pads BOTH spatial axes (time H and feature W)
+            //     with left = k-1 = 2, right = stride-1 = 1 (F.pad order
+            //     (W_l, W_r, H_l, H_r)). ggml conv takes a single symmetric p per
+            //     axis, so for the causal case we pad explicitly with ggml_pad_ext
+            //     (lp0/rp0 = W=feature, lp1/rp1 = H=time) and run the conv with p=0.
+            const bool causal = causal_;
+            auto pad_causal = [&](ggml_tensor* t) -> ggml_tensor* {
+                // ne0 = W (feature), ne1 = H (time); left k-1=2, right s-1=1 on both.
+                return ggml_pad_ext(ctx, t, /*lp0*/2, /*rp0*/1, /*lp1*/2, /*rp1*/1,
+                                    0, 0, 0, 0);
+            };
+
+            // NeMo's MaskedConvSequential zeros the trailing (pad) time frames of
+            // the conv input BEFORE every stage, tracking the valid length via
+            // calc_length. For the SYMMETRIC (offline) path a valid output frame
+            // never reaches a masked input frame (the kernel is centred), so the
+            // old code masks only the flattened output and stays byte-identical —
+            // keep that. For the CAUSAL path the right pad is +1, so the last valid
+            // output frame DOES read the trailing pad input frame; we must replicate
+            // the per-stage input masking. Mask the time axis (ne1=H) to `valid_t`
+            // frames via a [1, H, 1, 1] mask broadcast over W (feat) and C.
+            auto mask_time = [&](ggml_tensor* t, int valid_t) -> ggml_tensor* {
+                const int H = (int)t->ne[1];
+                if (valid_t >= H) return t;
+                ggml_tensor* tm = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
+                float* md = (float*)tm->data;
+                for (int h = 0; h < H; ++h) md[h] = (h < valid_t) ? 1.0f : 0.0f;
+                return ggml_mul(ctx, t, tm); // broadcast over ne0(W), ne2(C), ne3
+            };
+            // Per-stage valid time lengths (NeMo calc_length on the time axis).
+            // Stage entry length: T-1 (preprocessor valid mel len). all_paddings=3.
+            int valid_t0 = T - 1;                       // before stage 0
+            int valid_t1 = (valid_t0 + 3 - 3) / 2 + 1;  // before stage 2 (after stage 0)
+            int valid_t2 = (valid_t1 + 3 - 3) / 2 + 1;  // before stage 5 (after stage 2)
+
+            // ---- Stage 1: full Conv2d(1 -> C, k=3, s=2) + ReLU ----
             // kernel conv.0.weight: torch [C,1,3,3] -> ggml ne [3,3,1,C] = [KW,KH,IC,OC].
             ggml_tensor* w0 = clone_weight(ctx, ml, "encoder.pre_encode.conv.0.weight");
             ggml_tensor* b0 = clone_weight(ctx, ml, "encoder.pre_encode.conv.0.bias");
-            x = ggml_conv_2d(ctx, w0, x, /*s0*/2, /*s1*/2, /*p0*/1, /*p1*/1, /*d0*/1, /*d1*/1);
+            if (causal) {
+                x = mask_time(x, valid_t0);   // zero trailing pad mel frames
+                x = pad_causal(x);
+                x = ggml_conv_2d(ctx, w0, x, /*s0*/2, /*s1*/2, /*p0*/0, /*p1*/0, /*d0*/1, /*d1*/1);
+            } else {
+                x = ggml_conv_2d(ctx, w0, x, /*s0*/2, /*s1*/2, /*p0*/1, /*p1*/1, /*d0*/1, /*d1*/1);
+            }
             // x: ne [OW=F/2, OH=T/2, OC=C, 1]. Add bias broadcast over channels:
             // reshape bias to [1,1,C,1] so it broadcasts across W,H.
             x = ggml_add(ctx, x, ggml_reshape_4d(ctx, b0, 1, 1, C, 1));
@@ -95,12 +150,20 @@ void Subsampling::forward(const std::vector<float>& mel, int n_mels, int T,
                 { "encoder.pre_encode.conv.5.weight", "encoder.pre_encode.conv.5.bias",
                   "encoder.pre_encode.conv.6.weight", "encoder.pre_encode.conv.6.bias" },
             };
-            for (const StageW& s : stages) {
+            int stage_valid_t[2] = {valid_t1, valid_t2};
+            for (int si = 0; si < 2; ++si) {
+                const StageW& s = stages[si];
                 // Depthwise: weight torch [C,1,3,3] -> ggml ne [3,3,1,C] = [KW,KH,1,C].
                 // ggml_conv_2d_dw_direct expects a:[KW,KH,1,C], b:[W,H,C,N].
                 ggml_tensor* dww = clone_weight(ctx, ml, s.dw_w);
                 ggml_tensor* dwb = clone_weight(ctx, ml, s.dw_b);
-                x = ggml_conv_2d_dw_direct(ctx, dww, x, /*s0*/2, /*s1*/2, /*p0*/1, /*p1*/1, /*d0*/1, /*d1*/1);
+                if (causal) {
+                    x = mask_time(x, stage_valid_t[si]); // zero trailing pad time frames
+                    x = pad_causal(x);
+                    x = ggml_conv_2d_dw_direct(ctx, dww, x, /*s0*/2, /*s1*/2, /*p0*/0, /*p1*/0, /*d0*/1, /*d1*/1);
+                } else {
+                    x = ggml_conv_2d_dw_direct(ctx, dww, x, /*s0*/2, /*s1*/2, /*p0*/1, /*p1*/1, /*d0*/1, /*d1*/1);
+                }
                 // x: ne [OW, OH, C, 1]. dw_direct keeps WHCN; make it contiguous so
                 // the bias add and following ops see a standard layout.
                 x = ggml_cont(ctx, x);
