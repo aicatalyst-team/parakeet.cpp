@@ -33,7 +33,8 @@ set(PARAKEET_SRC
     src/relpos_attention.cpp
     src/conformer.cpp
     src/pos_enc.cpp
-    src/encoder.cpp)
+    src/encoder.cpp
+    src/ctc_decoder.cpp)
 
 if(PARAKEET_SHARED)
   add_library(parakeet SHARED ${PARAKEET_SRC})

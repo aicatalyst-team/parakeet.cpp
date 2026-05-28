@@ -15,12 +15,13 @@ pk_add_test(test_subsampling)
 pk_add_test(test_relpos_attention)
 pk_add_test(test_conformer)
 pk_add_test(test_encoder)
+pk_add_test(test_ctc)
 set_tests_properties(test_model_loader test_mel test_subsampling test_relpos_attention
-                     test_conformer test_encoder
+                     test_conformer test_encoder test_ctc
                      PROPERTIES LABELS "model")
 # These tests read fixtures/baselines via paths relative to the project root.
 set_tests_properties(test_mel test_subsampling test_relpos_attention test_conformer
-                     test_encoder
+                     test_encoder test_ctc
                      PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Python converter check (skips with exit 77 when the venv/model are absent).
