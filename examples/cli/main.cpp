@@ -25,8 +25,39 @@ static int cmd_info(const char* path) {
     return 0;
 }
 
+// parakeet-cli transcribe --model <m.gguf> --input <wav> -> prints transcript.
+static int cmd_transcribe(int argc, char** argv) {
+    std::string model, input;
+    for (int i = 0; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+            model = argv[++i];
+        } else if (std::strcmp(argv[i], "--input") == 0 && i + 1 < argc) {
+            input = argv[++i];
+        }
+    }
+    if (model.empty() || input.empty()) {
+        std::fprintf(stderr, "usage: parakeet-cli transcribe --model <m.gguf> --input <wav>\n");
+        return 2;
+    }
+    char* out = nullptr;
+    int rc = parakeet_transcribe_file(model.c_str(), input.c_str(), &out);
+    if (rc != 0) {
+        std::fprintf(stderr, "transcribe failed (code %d): model=%s input=%s\n",
+                     rc, model.c_str(), input.c_str());
+        return 1;
+    }
+    std::printf("%s\n", out);
+    parakeet_free_string(out);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc >= 3 && std::strcmp(argv[1], "info") == 0) return cmd_info(argv[2]);
-    std::fprintf(stderr, "usage: parakeet-cli info <model.gguf>\n");
+    if (argc >= 2 && std::strcmp(argv[1], "transcribe") == 0)
+        return cmd_transcribe(argc - 2, argv + 2);
+    std::fprintf(stderr,
+        "usage:\n"
+        "  parakeet-cli info <model.gguf>\n"
+        "  parakeet-cli transcribe --model <model.gguf> --input <wav>\n");
     return 2;
 }

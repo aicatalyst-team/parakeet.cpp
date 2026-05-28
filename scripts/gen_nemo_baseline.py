@@ -33,6 +33,11 @@ Stored tensors (squeezed; f32 except the int32 ids). Axis order documented in
 * ``ctc_logits``      ``[T', V+1]``        log-probs from ``m.ctc_decoder``
 * ``ctc_argmax_ids``  ``[T']`` int32       argmax over the vocab axis of logits
 
+String KVs:
+
+* ``baseline.detok_text``  detokenized text for the ``detok_ids`` fixture
+* ``baseline.ctc_text``    authoritative NeMo CTC greedy transcript of the clip
+
 Exit codes (ctest convention): 0 = ok, 2 = deps/model unavailable, 1 = fail.
 """
 import argparse
@@ -225,12 +230,28 @@ def main():
     detok_ids = np.array([10, 25, 100, 3, 7], dtype=np.int32)
     detok_text = m.tokenizer.ids_to_text(detok_ids.tolist())
 
+    # Authoritative CTC transcript of the clip from NeMo's own greedy CTC
+    # decoder. parakeet-tdt_ctc-110m is a hybrid; its default transcribe() uses
+    # the RNNT/TDT head, so we explicitly switch to the CTC head first. This is
+    # the end-to-end ground truth for pk::transcribe (Task 11). transcribe()
+    # returns a tuple (list_of_results, optional_beam_results); with
+    # return_hypotheses=False each result is a plain text string, but be
+    # defensive and extract .text from Hypothesis objects if present.
+    m.change_decoding_strategy(decoder_type="ctc")
+    assert m.cur_decoder == "ctc", f"expected CTC decoder, got {m.cur_decoder}"
+    with torch.no_grad():
+        out = m.transcribe([args.audio], batch_size=1, return_hypotheses=False)
+    hyps = out[0] if isinstance(out, tuple) else out
+    first = hyps[0]
+    ctc_text = first.text if hasattr(first, "text") else str(first)
+
     w = gguf.GGUFWriter(args.output, "parakeet-baseline")
     for k, v in cap.items():
         w.add_tensor(k, _squeeze(v))
     w.add_tensor("ctc_argmax_ids", np.ascontiguousarray(ids))
     w.add_tensor("detok_ids", detok_ids)
     w.add_string("baseline.detok_text", detok_text)
+    w.add_string("baseline.ctc_text", ctc_text)
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
@@ -241,6 +262,7 @@ def main():
     shapes["detok_ids"] = tuple(detok_ids.shape)
     print("baseline tensors:", shapes)
     print(f"baseline.detok_text: {repr(detok_text)}")
+    print(f"baseline.ctc_text: {repr(ctc_text)}")
     print(f"wrote {args.output}: tensors={len(shapes)} (dither=0.0, explicit forward)")
 
 
