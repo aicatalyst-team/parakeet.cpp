@@ -21,6 +21,9 @@ Stored tensors (squeezed; f32 except the int32 ids). Axis order documented in
 * ``subsampling_out`` ``[T', d_model]``    output of ``m.encoder.pre_encode``
 * ``pos_emb``         ``[2*T'-1, d_model]`` rel pos enc (``m.encoder.pos_enc`` out[1])
 * ``enc_pre_layers``  ``[T', d_model]``    tensor fed INTO conformer ``layers[0]``
+* ``l0_attn_in``      ``[T', d_model]``    self_attn input = ``norm_self_att(residual)``
+                                           (NOTE: residual = enc_pre_layers + 0.5*FFN1(..),
+                                           so this is NOT norm_self_att(enc_pre_layers))
 * ``l0_attn_out``     ``[T', d_model]``    output of ``layers[0].self_attn`` (RelPosMHA)
 * ``l0_conv_out``     ``[T', d_model]``    output of ``layers[0].conv`` (ConformerConvolution)
 * ``enc_layer_0``     ``[T', d_model]``    output of conformer ``layers[0]``
@@ -132,6 +135,20 @@ def main():
             cap[name] = t.detach().cpu().float().numpy()
         return fn
 
+    def save_attn_in(name):
+        # Forward PRE-hook on layers[0].self_attn: capture the `query` argument,
+        # i.e. the normalized attention input (== `key` == `value`). The conformer
+        # layer calls self_attn with query/key/value as KEYWORD args.
+        def fn(mod, args, kwargs):
+            t = kwargs.get("query") if "query" in kwargs else (args[0] if args else None)
+            if not isinstance(t, torch.Tensor):
+                raise RuntimeError(
+                    f"baseline: could not capture {name}: self_attn query was not a "
+                    f"tensor (args={len(args)}, kwargs={sorted(kwargs)})"
+                )
+            cap[name] = t.detach().cpu().float().numpy()
+        return fn
+
     def submodule(path):
         """Resolve a dotted attribute path under ``m``; clear error if missing."""
         obj = m
@@ -156,6 +173,12 @@ def main():
         submodule("encoder.pos_enc").register_forward_hook(save_pos_emb("pos_emb")),
         submodule("encoder.layers[0]").register_forward_pre_hook(
             save_layer_input("enc_pre_layers"), with_kwargs=True
+        ),
+        # self_attn input = norm_self_att(residual) where residual already includes
+        # FFN1. Capturing it directly lets the relpos-attention parity test feed the
+        # exact normalized input without re-implementing FFN1 (that's the next task).
+        submodule("encoder.layers[0].self_attn").register_forward_pre_hook(
+            save_attn_in("l0_attn_in"), with_kwargs=True
         ),
         submodule("encoder.layers[0].self_attn").register_forward_hook(
             save("l0_attn_out")

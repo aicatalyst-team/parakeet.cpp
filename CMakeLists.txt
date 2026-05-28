@@ -29,7 +29,8 @@ set(PARAKEET_SRC
     src/ggml_graph.cpp
     src/fft.cpp
     src/mel.cpp
-    src/subsampling.cpp)
+    src/subsampling.cpp
+    src/relpos_attention.cpp)
 
 if(PARAKEET_SHARED)
   add_library(parakeet SHARED ${PARAKEET_SRC})
