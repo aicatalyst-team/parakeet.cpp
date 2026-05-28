@@ -29,7 +29,7 @@ CPU, batch 1, deterministic greedy (NeMo 2.7.3).
 | `parakeet-ctc-1.1b` | CTC | `ctc` | 1024 / 42 | 80 | **true** | 1024 | CTC | **0.0** | PASS |
 | `parakeet-rnnt-0.6b` | RNNT | `rnnt` | 1024 / 24 | 80 | **true** | 1024 | RNNT | **0.0** | PASS |
 | `parakeet-rnnt-1.1b` | RNNT | `rnnt` | 1024 / 42 | 80 | **true** | 1024 | RNNT | **0.0** | PASS |
-| `parakeet_realtime_eou_120m-v1` | Streaming + EOU | — | — | — | — | — | — | — | Future work (Phase 5) |
+| `parakeet_realtime_eou_120m-v1` | Streaming + EOU | `rnnt` | 512 / 17 | 128 | false | 1026 | RNNT (offline, limited-context) | **0.0** | PASS (Phase 5 — 5a milestone) |
 
 Notes:
 - `xscaling` = NeMo FastConformer `xscale=sqrt(d_model)` (true) vs `xscale=None` (false).
@@ -41,6 +41,10 @@ Notes:
   regression: `tests/test_transcribe_ctc.cpp` (`PARAKEET_TEST_GGUF_CTC`) and
   `tests/test_transcribe_rnnt.cpp` (`PARAKEET_TEST_GGUF_RNNT`) — both skip (exit
   77) in CI unless the corresponding GGUF env var is set.
+- `parakeet_realtime_eou_120m-v1` offline (5a): vocab 1026 includes `<EOU>`=1024
+  and `<EOB>`=1025; blank_id=1026 (V_plus=1027); the transducer emits `<EOU>`
+  literally at end-of-utterance — the C++ offline transcript matches NeMo including
+  the trailing `<EOU>` token. Streaming (5b, 5c) is future work (Tasks 5-7).
 
 ---
 
@@ -381,3 +385,76 @@ when the corresponding GGUF env var is absent:
 Each asserts the C++ transcript equals the stored NeMo reference word-for-word
 (WER 0) on `tests/fixtures/speech.wav`. All three carry the `model` label and run
 from the project root (WORKING_DIRECTORY).
+
+---
+
+## Phase 5 — Streaming EOU model offline (5a milestone)
+
+**Model:** `nvidia/parakeet_realtime_eou_120m-v1` — cache-aware streaming
+FastConformer + RNNT (pure RNNT, no TDT duration table).
+
+**Offline (limited-context) validated:** the full pipeline — mel → encoder with
+`conv_norm_type=layer_norm`, causal depthwise conv, causal subsampling, and
+chunked-limited attention mask (`att_context_size=[70,1]`,
+`att_context_style=chunked_limited`) — matches NeMo's offline transcript on
+`tests/fixtures/speech.wav` at **WER 0** (byte-for-byte identical), including
+the exact token-id sequence (45 tokens, last = 1024 = `<EOU>`).
+
+### Model config
+
+| Field | Value |
+| --- | --- |
+| arch | `rnnt` |
+| d_model / layers / heads | 512 / 17 / 8 |
+| mel | 128 |
+| conv_norm_type | `layer_norm` |
+| conv_causal | `true` |
+| causal_downsampling | `true` |
+| att_context_size | `[70, 1]` |
+| att_context_style | `chunked_limited` |
+| xscaling | `false` |
+| vocab_size | 1026 (`<EOU>`=1024, `<EOB>`=1025) |
+| blank_id | 1026 (V_plus = 1027) |
+| tdt_durations | none (pure RNNT → rnnt_greedy) |
+
+### NeMo vs C++ transcripts + WER (`tests/fixtures/speech.wav`)
+
+| Mode | NeMo (offline RNNT) | C++ `parakeet-cli transcribe --decoder tdt` | WER |
+| --- | --- | --- | --- |
+| Offline (limited-context) | `well i don't wish to see it any more observed phoebe turning away her eyes it is certainly very like the old portrait<EOU>` | `well i don't wish to see it any more observed phoebe turning away her eyes it is certainly very like the old portrait<EOU>` | **0.0** |
+
+The C++ transcript is **byte-for-byte identical** to NeMo, including the literal
+`<EOU>` token at the end (token id 1024 emitted by the RNNT transducer). The
+token-id sequence (45 tokens) is also identical to the NeMo reference stored in
+`/tmp/baseline_eou.gguf` (`rnnt_token_ids` tensor).
+
+Note: for this offline 5a milestone, `<EOU>` appears literally in the detokenized
+text — it is rendered by the BPE detokenizer as the piece string `"<EOU>"`.
+EOU-as-a-separate-event (stripping it from text + exposing a timed EOU signal) is
+planned for Task 7 (Part 5c).
+
+### Regression test
+
+`tests/test_transcribe_eou.cpp` (`test_transcribe_eou`, label `model`,
+`WORKING_DIRECTORY`) — skips (exit 77) unless both `PARAKEET_TEST_GGUF_EOU` and
+`PARAKEET_TEST_BASELINE_EOU` are set. Asserts:
+1. `pk::transcribe(eou.gguf, speech.wav, kTDT)` equals `baseline.rnnt_text` (incl. `<EOU>`).
+2. The raw RNNT token-id sequence equals the `rnnt_token_ids` int32 tensor from the baseline.
+
+Reproduce:
+
+```bash
+# Convert (if not already done)
+.venv/bin/python scripts/convert_parakeet_to_gguf.py \
+    --model nvidia/parakeet_realtime_eou_120m-v1 --output /tmp/eou.gguf
+
+# CLI
+./build/examples/cli/parakeet-cli transcribe \
+    --model /tmp/eou.gguf --input tests/fixtures/speech.wav --decoder tdt
+# -> well i don't wish to see it any more observed phoebe ... portrait<EOU>
+
+# ctest
+PARAKEET_TEST_GGUF_EOU=/tmp/eou.gguf \
+PARAKEET_TEST_BASELINE_EOU=/tmp/baseline_eou.gguf \
+ctest --test-dir build -R test_transcribe_eou --output-on-failure
+```
