@@ -30,7 +30,8 @@ set(PARAKEET_SRC
     src/fft.cpp
     src/mel.cpp
     src/subsampling.cpp
-    src/relpos_attention.cpp)
+    src/relpos_attention.cpp
+    src/conformer.cpp)
 
 if(PARAKEET_SHARED)
   add_library(parakeet SHARED ${PARAKEET_SRC})
