@@ -133,16 +133,43 @@ loader selects via `decoder._target_`.
 | `parakeet-ctc-0.6b`, `parakeet-ctc-1.1b` | CTC | 1 |
 | `parakeet-rnnt-0.6b`, `parakeet-rnnt-1.1b` | RNNT | 2 |
 | `parakeet-tdt-1.1b`, `parakeet-tdt-0.6b` (v1) | TDT | 3 |
-| `parakeet-tdt-0.6b-v2` (EN, **north star**) | TDT | 3 |
-| `parakeet-tdt-0.6b-v3` (multilingual, 25 EU langs) | TDT | 3 (≈ free once TDT lands — only a larger BPE vocab) |
-| `parakeet-tdt_ctc-110m`, `parakeet-tdt_ctc-1.1b` | Hybrid TDT+CTC | 3 (cross-check: both heads in one ckpt) |
+| `parakeet-tdt_ctc-110m` | Hybrid TDT+CTC | **1+3 primary anchor** (both heads, ≈110M) |
+| `parakeet-tdt_ctc-1.1b` | Hybrid TDT+CTC | 3 (scale validation) |
+| `parakeet-tdt-0.6b-v2` (EN, **north star quality**) | TDT | 3 (headline target) |
+| `parakeet-tdt-0.6b-v3` (multilingual, 25 EU langs) | TDT | 3 (**explicit** target; larger BPE vocab) |
 | `parakeet_realtime_eou_120m-v1` | streaming + EOU | 5 (deferred) |
 
 ### Tensor-name prefixes per family
 
-| | Shared | CTC head | Prediction net | Joint | Aux CTC (hybrid) |
-| --- | --- | --- | --- | --- | --- |
-| state_dict prefix | `encoder.*` | `decoder.*` | `decoder.prediction.*` | `joint.{enc,pred,joint_net}.*` | `ctc_decoder.*` |
+Confirmed from the real `parakeet-tdt_ctc-110m` state_dict:
+
+| Module | state_dict prefix |
+| --- | --- |
+| Subsampling front end | `encoder.pre_encode.*` (e.g. `encoder.pre_encode.out.weight`) |
+| Conformer layers | `encoder.layers.<i>.*` (e.g. `…norm_feed_forward1.weight`) |
+| Mel filterbank + window | `preprocessor.featurizer.fb`, `preprocessor.featurizer.window` |
+| CTC head (and aux CTC in hybrid) | `decoder.*` (CTC model) / `ctc_decoder.decoder_layers.0.*` (hybrid) |
+| Prediction net (LSTM) | `decoder.prediction.embed.*`, `decoder.prediction.dec_rnn.*` |
+| Joint | `joint.enc.*`, `joint.pred.*`, `joint.joint_net.<n>.*` (final linear = output) |
+
+The **mel filterbank is a buffer in the checkpoint** (`preprocessor.featurizer.fb`),
+so the converter lifts it directly rather than recomputing librosa — exact parity
+for free.
+
+### Validated anchor config (`parakeet-tdt_ctc-110m`, 2026-05-28)
+
+`EncDecHybridRNNTCTCBPEModel`, all three heads present. Encoder: feat_in 80,
+n_layers 17, d_model 512, n_heads 8, ff×4, dw_striding ÷8, conv_channels 256,
+rel_pos, conv_kernel 9, **conv_norm_type batch_norm**, **xscaling False**,
+att_context [-1,-1]. Prednet: RNNTDecoder LSTM, pred_hidden 640, 1 layer. Joint:
+RNNTJoint, joint_hidden 640, relu, **num_extra_outputs 5**, output layer
+`(1030, 640)` = 1024 vocab + 1 blank + 5 durations. **Durations `[0,1,2,3,4]`**
+(`decoding.model_type=tdt`). TDT logit layout: `[0:1025]` = tokens incl. blank at
+1024; `[1025:1030]` = duration distribution over `[0,1,2,3,4]`. Tokenizer
+SentencePiece, vocab 1024.
+
+Note `xscaling` is **per-model** (False here, True on `parakeet-ctc-0.6b`) — the
+loader must read it from KV, never hardcode.
 
 ## 3. Scope & phasing
 
@@ -154,21 +181,32 @@ each decoder is layered on.
   skeleton, converter skeleton, Python baseline-dumper harness.
 - **Phase 1 — Backbone (milestone):** log-mel preprocessing + FastConformer
   encoder + CTC decoder → end-to-end CTC transcription. Tensor parity through
-  every stage; token parity end-to-end. Anchor: `nvidia/parakeet-ctc-0.6b`.
-- **Phase 2 — RNNT:** prediction net (LSTM) + joint + greedy transducer loop.
-  Token/WER parity. Anchor: `nvidia/parakeet-rnnt-0.6b`.
-- **Phase 3 — TDT (north star):** duration head + duration-aware greedy loop →
-  `nvidia/parakeet-tdt-0.6b-v2` works. Token/WER parity. Headline deliverable.
-  Once TDT lands, the multilingual `-v3` (only a larger BPE vocab) and the
-  hybrid `tdt_ctc` checkpoints (both heads on one encoder) come nearly for free.
+  every stage; token parity end-to-end.
+- **Phase 2 — Transducer core:** prediction net (LSTM) + joint network. Tensor
+  parity on the joint output. Pure RNNT (`durations=[]`) and TDT share this code;
+  pure-RNNT checkpoints (`parakeet-rnnt-*`) are supported via metadata but are
+  not on the critical path.
+- **Phase 3 — TDT (north star):** duration head + duration-aware greedy loop.
+  Token/WER parity. Headline deliverable. The multilingual `-v3` (larger BPE
+  vocab, no architecture change) is an **explicit** Phase-3 target.
+
+**Anchor checkpoint:** Phases 1+3 are anchored on a **single hybrid TDT+CTC
+checkpoint** — `nvidia/parakeet-tdt_ctc-110m` (≈110M, fast to convert / run /
+baseline / CI). It exposes a CTC head (Phase 1 encoder + CTC validation) *and* a
+TDT decoder (Phase 3) on one shared encoder, so the whole critical path is
+validated against one model. Scale + headline validation: `parakeet-tdt_ctc-1.1b`
+and the TDT-only `parakeet-tdt-0.6b-v2` / `-v3` (same architecture, so they fall
+out once Phase 3 lands).
 - **Phase 4 — Productionize:** quantization (Q8_0 / Q4_K …), flat C-API, LocalAI
   backend, HF model publishing, full CI.
 - **Phase 5 — Streaming (deferred):** cache-aware chunked attention + conv /
   attention caches.
 
-`parakeet-tdt-0.6b-v2` is TDT-only (no CTC head); that is why Phase 1's
-end-to-end CTC validation anchors on a separate CTC checkpoint. Both are 0.6B
-FastConformer, so the encoder code is identical.
+Using a hybrid `tdt_ctc` checkpoint as the anchor avoids juggling two separate
+models for Phases 1 and 3: the CTC head validates the shared encoder end-to-end
+in Phase 1, and the same checkpoint's TDT decoder is the Phase 3 target. The
+TDT-only `parakeet-tdt-0.6b-v2` is the eventual quality headline, validated once
+the TDT path works (identical architecture, metadata-driven loader).
 
 ## 4. Repository layout
 
@@ -234,8 +272,9 @@ WAV → audio_io(16k mono) → mel[80,T] → subsampling(÷8) → FastConformer 
   ff_dim, conv_kernel, subsampling_factor, xscaling), preprocessor params,
   decoder params (pred_hidden, pred_layers, joint_hidden, durations list,
   blank_id, vocab_size), tokenizer vocab pieces.
-- **Mel filterbank tensor** precomputed (librosa slaney, 80×(n_fft/2+1)) and
-  stored in the GGUF — guarantees mel parity.
+- **Mel filterbank tensor** lifted straight from the checkpoint buffer
+  `preprocessor.featurizer.fb` (80×(n_fft/2+1)) into the GGUF — exact mel parity
+  with no librosa recompute. The Hann `window` buffer is available the same way.
 - **Tensor naming** mirrors NeMo state dict with a short prefix map
   (`encoder.*`→`enc.*`, `ctc_decoder.*`→`ctc.*`, prediction→`pred.*`,
   joint→`joint.*`); documented in `docs/conversion.md`. `--strict` flags
@@ -302,11 +341,12 @@ tensors. This is a hard prerequisite for Phase 1+, set up in Phase 0.
 
 ## 11. Definition of done per phase
 
-- **Phase 1:** `parakeet-ctc-0.6b` transcribes a test clip correctly;
-  mel/subsampling/encoder/CTC tensor parity within tolerance; `parakeet-cli
-  transcribe` works; CI smoke.
-- **Phase 2:** `parakeet-rnnt-0.6b` greedy token parity.
-- **Phase 3:** `parakeet-tdt-0.6b-v2` greedy token parity + WER on clip set.
+- **Phase 1:** `parakeet-tdt_ctc-110m` (CTC head) transcribes a test clip
+  correctly; mel/subsampling/encoder/CTC tensor parity within tolerance;
+  `parakeet-cli transcribe` works; CI smoke.
+- **Phase 2:** prediction-net + joint tensor parity on `parakeet-tdt_ctc-110m`.
+- **Phase 3:** `parakeet-tdt_ctc-110m` (TDT head) greedy token parity + WER, then
+  the same for `parakeet-tdt-0.6b-v2` and multilingual `-v3`.
 - **Phase 4:** quantized GGUFs published; C-API + LocalAI backend; full CI.
 
 ## 12. Out of scope (v1)
