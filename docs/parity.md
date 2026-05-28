@@ -229,6 +229,57 @@ shells out to `parakeet-cli transcribe` (head ctc→`--decoder ctc`,
 rnnt/tdt→`--decoder tdt`), computes word-level WER, and exits 0 on PASS / 1 on
 WER>0 / 77 if NeMo can't be imported.
 
+## Phase 3.5 — Standard RNNT coverage (vs NeMo)
+
+The pure-RNNT `EncDecRNNTBPEModel` checkpoints (`parakeet-rnnt-*`) are the first
+end-to-end validation of the **standard RNN-Transducer greedy loop** — a path no
+prior checkpoint exercised. Every transducer validated in Phase 3 was a TDT model
+(its joint emits `vocab+1+num_durations` and decoding is duration-aware). A pure
+RNNT model has **no duration head**: its joint output is exactly `vocab+1`
+(`Joint::num_durations()==0`, `V_plus=vocab+1`), and greedy decoding advances time
+by exactly one frame on a blank and emits-and-stays on a non-blank (capped by
+`max_symbols`).
+
+1. **`pk::rnnt_greedy`** (`src/rnnt.hpp` / `src/rnnt.cpp`) ports NeMo
+   `GreedyRNNTInfer._greedy_decode`. Versus `pk::tdt_greedy`: no duration logits
+   (argmax over the full `vocab+1` joint output); blank → advance `t` by 1;
+   non-blank → emit + commit state + stay at `t` (capped by `max_symbols=10`).
+2. **Routing** (`src/parakeet.cpp`): when the transducer head is selected, the
+   loader's `cfg.tdt_durations` now decides the loop — non-empty → `tdt_greedy`
+   (unchanged); empty → `rnnt_greedy`. This makes `arch ∈ {rnnt, hybrid_rnnt_ctc}`
+   (and any TDT-less transducer) work; it replaces the old guard that fell back to
+   CTC when no durations were configured (which a pure-RNNT model lacks). TDT and
+   CTC paths are unchanged. Both `parakeet-rnnt-*` models also set `xscaling=true`.
+
+### Model `info` (config read from the GGUF metadata)
+
+| Model | arch | d_model / layers / heads | mels | conv norm | xscaling | durations | vocab |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `parakeet-rnnt-0.6b` | `rnnt` | 1024 / 24 / 8 | 80 | batch_norm | **true** | none | 1024 |
+| `parakeet-rnnt-1.1b` | `rnnt` | 1024 / 42 / 8 | 80 | batch_norm | **true** | none | 1024 |
+
+### NeMo vs C++ transcripts + WER (`tests/fixtures/speech.wav`)
+
+| Model | NeMo (RNNT) | C++ `parakeet-cli transcribe --decoder tdt` | WER |
+| --- | --- | --- | --- |
+| `parakeet-rnnt-0.6b` | `well i don't wish to see it any more observed phoebe turning away her eyes it is certainly very like the old portrait` | `well i don't wish to see it any more observed phoebe turning away her eyes it is certainly very like the old portrait` | **0.0** |
+| `parakeet-rnnt-1.1b` | `well i don't wish to see it any more observed phoebe turning away her eyes it is certainly very like the old portrait` | `well i don't wish to see it any more observed phoebe turning away her eyes it is certainly very like the old portrait` | **0.0** |
+
+Both are **byte-for-byte identical** to NeMo (0 edits over 23 reference words) —
+the `rnnt_greedy` loop matched on the first run with no divergence debugging
+needed. The CLI `--decoder tdt` selects the transducer head and now routes to
+`rnnt_greedy` because the duration table is empty. Validated with the harness:
+
+```bash
+.venv/bin/python scripts/convert_parakeet_to_gguf.py \
+    --model nvidia/parakeet-rnnt-0.6b --output /tmp/val_rnnt06.gguf
+./build/examples/cli/parakeet-cli info /tmp/val_rnnt06.gguf   # arch=rnnt, xscaling=true
+.venv/bin/python scripts/validate_vs_nemo.py \
+    --model nvidia/parakeet-rnnt-0.6b --gguf /tmp/val_rnnt06.gguf \
+    --audio tests/fixtures/speech.wav --head rnnt
+# -> MODEL nvidia/parakeet-rnnt-0.6b HEAD rnnt arch=rnnt xscaling=true WER 0.0000 ... PASS
+```
+
 ## Test suite status
 
 `ctest --test-dir build --output-on-failure` (with `PARAKEET_TEST_GGUF`,

@@ -38,6 +38,7 @@ set(PARAKEET_SRC
     src/prediction.cpp
     src/joint.cpp
     src/tdt.cpp
+    src/rnnt.cpp
     src/tokenizer.cpp
     src/search.cpp)
 

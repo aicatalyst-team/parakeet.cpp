@@ -9,6 +9,7 @@
 #include "prediction.hpp"
 #include "joint.hpp"
 #include "tdt.hpp"
+#include "rnnt.hpp"
 
 #include <cstdlib>
 #include <cstring>
@@ -70,13 +71,6 @@ std::string transcribe(const std::string& model_path, const std::string& wav_pat
             for (int c = 0; c < d_model; ++c)
                 enc_row[t * d_model + c] = enc_out[c * Tout + t];
 
-        // Guard: if no TDT durations are configured (e.g. pure RNNT without TDT
-        // duration table), fall back to CTC to avoid a crash.
-        if (cfg.tdt_durations.empty()) {
-            // Fall through to CTC below by recursing with kCTC.
-            return transcribe(model_path, wav_path, Decoder::kCTC);
-        }
-
         // 5b. Prediction net + Joint.
         PredictionNet pred(loader);
         Joint        joint(loader);
@@ -85,9 +79,19 @@ std::string transcribe(const std::string& model_path, const std::string& wav_pat
         // emit this value; if/when it does the config could be read here).
         const int max_symbols = 10;
 
-        std::vector<int32_t> ids = tdt_greedy(
-            pred, joint, enc_row, Tout, d_model,
-            cfg.tdt_durations, (int)cfg.blank_id, max_symbols);
+        // Branch on the duration table: TDT (durations present) uses the
+        // duration-aware greedy loop; a pure RNNT transducer (no durations, e.g.
+        // arch ∈ {rnnt, hybrid_rnnt_ctc}) uses the standard RNNT greedy loop.
+        std::vector<int32_t> ids;
+        if (!cfg.tdt_durations.empty()) {
+            ids = tdt_greedy(
+                pred, joint, enc_row, Tout, d_model,
+                cfg.tdt_durations, (int)cfg.blank_id, max_symbols);
+        } else {
+            ids = rnnt_greedy(
+                pred, joint, enc_row, Tout, d_model,
+                (int)cfg.blank_id, max_symbols);
+        }
 
         // 6a. Detokenize.
         return detokenize(loader.tokenizer_pieces(), ids);
