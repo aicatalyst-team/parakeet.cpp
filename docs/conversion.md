@@ -1,0 +1,132 @@
+# GGUF conversion schema
+
+`scripts/convert_parakeet_to_gguf.py` turns a NeMo Parakeet checkpoint (HF id or
+local `.nemo`) into a single **GGUF v3** file consumed by the C++ `ModelLoader`.
+
+The design rule is **fully metadata-driven**: every configuration value lives in
+GGUF KV, and **tensor names are kept verbatim from the NeMo `state_dict`** (no
+renaming). This makes the C++ port a 1:1 mapping of the reference model — new
+checkpoints/variants require no C++ changes, only new KV/tensors.
+
+```
+.venv/bin/python scripts/convert_parakeet_to_gguf.py \
+    --model nvidia/parakeet-tdt_ctc-110m \
+    --output model.gguf
+```
+
+The acceptance check is `tests/python/check_convert.py` (registered as the
+`check_convert` ctest, label `model`; skips with exit 77 if `gguf`/NeMo or the
+checkpoint are unavailable).
+
+## GGUF header
+
+- `general.architecture` = `"parakeet"` (the GGUFWriter arch; what the reader keys on).
+- `general.name` = the `--model` argument (HF id or `.nemo` path).
+
+## KV metadata (`parakeet.*`)
+
+All keys below are emitted for the hybrid anchor `parakeet-tdt_ctc-110m`. CTC-only
+checkpoints omit the `parakeet.decoder.*` / `parakeet.joint.*` / `parakeet.tdt.*`
+keys; non-TDT transducers omit `parakeet.tdt.durations`.
+
+| Key | GGUF type | Meaning | Source | 110m value |
+| --- | --- | --- | --- | --- |
+| `parakeet.arch` | STRING | One of `ctc` / `rnnt` / `tdt` / `hybrid_rnnt_ctc` / `hybrid_tdt_ctc` | arch detection (below) | `hybrid_tdt_ctc` |
+| `parakeet.encoder.feat_in` | UINT32 | Encoder input feature dim (= n_mels) | `cfg.encoder.feat_in` | 80 |
+| `parakeet.encoder.d_model` | UINT32 | Encoder model dim | `cfg.encoder.d_model` | 512 |
+| `parakeet.encoder.n_layers` | UINT32 | Conformer layer count | `cfg.encoder.n_layers` | 17 |
+| `parakeet.encoder.n_heads` | UINT32 | Attention heads | `cfg.encoder.n_heads` | 8 |
+| `parakeet.encoder.ff_dim` | UINT32 | FFN hidden dim = `d_model * ff_expansion_factor` | `cfg.encoder` | 2048 |
+| `parakeet.encoder.conv_kernel` | UINT32 | Depthwise conv kernel size | `cfg.encoder.conv_kernel_size` | 9 |
+| `parakeet.encoder.conv_norm_type` | STRING | Conv-module norm: `batch_norm` or `layer_norm` | `cfg.encoder.conv_norm_type` | `batch_norm` |
+| `parakeet.encoder.subsampling_factor` | UINT32 | Time downsample factor | `cfg.encoder.subsampling_factor` | 8 |
+| `parakeet.encoder.subsampling_conv_channels` | UINT32 | Subsampling conv channels | `cfg.encoder.subsampling_conv_channels` | 256 |
+| `parakeet.encoder.xscaling` | BOOL | Scale embeddings by √d_model | `cfg.encoder.xscaling` | `false` |
+| `parakeet.encoder.pos_emb_max_len` | UINT32 | Max relative-pos length | `cfg.encoder.pos_emb_max_len` | 5000 |
+| `parakeet.preprocessor.sample_rate` | UINT32 | Audio sample rate | `featurizer.sample_rate` | 16000 |
+| `parakeet.preprocessor.n_mels` | UINT32 | Mel filterbank count | `featurizer.nfilt` | 80 |
+| `parakeet.preprocessor.n_fft` | UINT32 | FFT size | `featurizer.n_fft` | 512 |
+| `parakeet.preprocessor.win_length` | UINT32 | STFT window length (samples) | `featurizer.win_length` | 400 |
+| `parakeet.preprocessor.hop_length` | UINT32 | STFT hop length (samples) | `featurizer.hop_length` | 160 |
+| `parakeet.preprocessor.preemph` | FLOAT32 | Pre-emphasis coefficient (0 = off) | `featurizer.preemph` | 0.97 |
+| `parakeet.preprocessor.mag_power` | FLOAT32 | Spectrogram magnitude power | `featurizer.mag_power` | 2.0 |
+| `parakeet.preprocessor.normalize` | STRING | Feature normalization mode | `featurizer.normalize` | `per_feature` |
+| `parakeet.preprocessor.log_zero_guard` | FLOAT32 | Additive log zero-guard (default 2⁻²⁴) | `featurizer.log_zero_guard_value` | 5.96e-08 |
+| `parakeet.vocab_size` | UINT32 | Tokenizer vocab size | `m.tokenizer.vocab_size` | 1024 |
+| `parakeet.blank_id` | UINT32 | Blank token id (always == vocab_size) | derived | 1024 |
+| `parakeet.tokenizer.pieces` | ARRAY\<STRING\> | SentencePiece pieces, index = token id (`▁` = leading space) | `tokenizer.ids_to_tokens([i])[0]` | len 1024 |
+| `parakeet.decoder.pred_hidden` | UINT32 | RNNT prediction-net hidden size | `cfg.decoder.prednet.pred_hidden` | 640 |
+| `parakeet.decoder.pred_rnn_layers` | UINT32 | RNNT prediction-net LSTM layers | `cfg.decoder.prednet.pred_rnn_layers` | 1 |
+| `parakeet.joint.joint_hidden` | UINT32 | Joint-net hidden size | `cfg.joint.jointnet.joint_hidden` | 640 |
+| `parakeet.joint.activation` | STRING | Joint-net activation | `cfg.joint.jointnet.activation` | `relu` |
+| `parakeet.tdt.durations` | ARRAY\<INT32\> | TDT duration buckets | `cfg.decoding.durations` (fallback `model_defaults.tdt_durations`) | `[0,1,2,3,4]` |
+
+**Effective preprocessor values:** restored configs frequently leave
+`mag_power` / `preemph` / `log_zero_guard_value` as `None`, so NeMo falls back to
+`FilterbankFeatures` defaults. The converter therefore reads the **instantiated**
+`m.preprocessor.featurizer` attributes (effective runtime values), not the raw
+cfg.
+
+## Arch detection (`parakeet.arch`)
+
+`detect_arch()` mirrors spec §2.1:
+
+```
+1. cfg.aux_ctc present:
+     loss.loss_name == "tdt" OR decoding.durations non-empty  → hybrid_tdt_ctc
+     else                                                      → hybrid_rnnt_ctc
+2. else cfg.joint present:
+     decoding.durations non-empty OR joint.num_extra_outputs>0 → tdt
+     else                                                      → rnnt
+3. else                                                        → ctc
+```
+
+For `parakeet-tdt_ctc-110m`: `aux_ctc` present + `loss.loss_name == "tdt"` →
+`hybrid_tdt_ctc`.
+
+## Tensors (verbatim NeMo names, F32)
+
+Every tensor is written under its **exact `state_dict` key**, converted to F32
+(no quantization in this converter; quantization is a separate CLI step). Rules:
+
+- Skip everything under `preprocessor.*` **except** the two featurizer buffers
+  (see below).
+- Skip 0-dimensional scalar tensors (e.g. `…batch_norm.num_batches_tracked`).
+
+State-dict prefixes present in the hybrid anchor (690 tensors total):
+
+| Module | Prefix | Example |
+| --- | --- | --- |
+| Mel filterbank buffer | `preprocessor.featurizer.fb` | shape numpy `(1, 80, 257)` = `(1, n_mels, n_fft/2+1)` |
+| Hann window buffer | `preprocessor.featurizer.window` | shape `(win_length,)` = `(400,)` |
+| Subsampling front end | `encoder.pre_encode.*` | `encoder.pre_encode.out.weight` |
+| Conformer layers | `encoder.layers.<i>.*` | `encoder.layers.0.norm_feed_forward1.weight`, `encoder.layers.0.self_attn.pos_bias_u` |
+| CTC head (hybrid aux CTC) | `ctc_decoder.decoder_layers.0.*` | `ctc_decoder.decoder_layers.0.weight` shape `(vocab+1, d_model, 1)` |
+| Prediction net (LSTM) | `decoder.prediction.*` | `decoder.prediction.embed.weight`, `decoder.prediction.dec_rnn.lstm.weight_ih_l0` |
+| Joint net | `joint.{enc,pred,joint_net}.*` | `joint.joint_net.2.weight` shape `(vocab+1+D, joint_hidden)` |
+
+> Pure-CTC checkpoints (`EncDecCTCModelBPE`) put the CTC head under `decoder.*`
+> instead of `ctc_decoder.*`; the verbatim rule preserves whatever the checkpoint
+> uses.
+
+### Featurizer buffers
+
+The mel filterbank is a **buffer in the checkpoint** (`preprocessor.featurizer.fb`,
+numpy shape `(1, n_mels, n_fft/2+1)`), so the converter lifts it directly rather
+than recomputing librosa — exact mel parity for free. Note GGUF stores dimensions
+reversed relative to numpy, so the GGUF tensor shape reads `[257, 80, 1]`. The
+Hann `window` buffer (`preprocessor.featurizer.window`, shape `(win_length,)`) is
+exported the same way.
+
+## Worked example — `parakeet-tdt_ctc-110m`
+
+```
+wrote model.gguf: arch=hybrid_tdt_ctc vocab=1024 tensors=690
+```
+
+`EncDecHybridRNNTCTCBPEModel`. Encoder: feat_in 80, d_model 512, n_layers 17,
+n_heads 8, ff_dim 2048, conv_kernel 9, conv_norm_type `batch_norm`, subsampling ÷8
+(channels 256), `xscaling=false`. Preprocessor: 80 mels, n_fft 512, win 400,
+hop 160, preemph 0.97, mag_power 2.0, per-feature norm. Transducer: pred_hidden
+640 / 1 LSTM layer, joint_hidden 640 / relu. TDT durations `[0,1,2,3,4]`. Vocab
+1024, blank id 1024, SentencePiece pieces stored in KV.
