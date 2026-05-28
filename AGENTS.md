@@ -5,43 +5,74 @@ Durable reference for humans and agents maintaining parakeet.cpp.
 ## What this project is
 
 parakeet.cpp is a C++17/ggml inference port of NVIDIA NeMo Parakeet ASR.
-It targets CPU (GPU backends are wired but not exercised) and is designed for
-parity with the NeMo reference: a Python converter turns a NeMo checkpoint into
-a metadata-driven GGUF, and a C++ model loader + conformer inference engine
-run the same computation natively.
+It targets CPU (GPU backends are wired but not exercised in CI) and is designed
+for parity with the NeMo reference: a Python converter turns a NeMo checkpoint
+into a metadata-driven GGUF, and a C++ model loader + conformer inference engine
+run the same computation natively, with no Python dependency at inference time.
 
-Current status: Phase 3.5 complete.  Supports all offline Parakeet families —
+The public surface ships as a flat C-API (`include/parakeet_capi.h` +
+`libparakeet.so`) suitable for `dlopen`/FFI/LocalAI integration.
+
+Current status: Phase 4 complete.  Supports all offline Parakeet families —
 CTC, RNNT, TDT, and hybrid TDT-CTC (0.6B/1.1B/110M, EN + multilingual v3) —
-validated at WER 0 vs NeMo on every published checkpoint.  Cache-aware
-streaming + EOU decoding (parakeet_realtime_eou_120m) is Phase 5 (future work).
+validated at WER 0 vs NeMo on every published checkpoint.  Quantization
+(F16/Q8_0/K-quants) validated at WER 0.  Cache-aware streaming + EOU decoding
+(`parakeet_realtime_eou_120m`) is Phase 5 (future work).
 
 ## Repository layout
 
 ```
-include/             public C/C++ API (parakeet.h)
+include/             public C/C++ headers
+                       parakeet.h          — C++ API
+                       parakeet_capi.h     — flat C-API for FFI / dlopen
 src/                 libparakeet implementation
-                       parakeet.cpp    — version()
-                       common.hpp/cpp  — logging helpers
-                       audio_io.hpp/cpp — dr_wav load + linear resample to 16k
+                       model.hpp/cpp       — load-once pk::Model
+                       parakeet.cpp        — thin transcribe() wrapper
+                       parakeet_capi.cpp   — flat C-API implementation
+                       common.hpp/cpp      — logging helpers
+                       audio_io.hpp/cpp    — dr_wav load + linear resample to 16k
                        model_loader.hpp/cpp — GGUF → ParakeetConfig + name→tensor
-examples/cli/        parakeet-cli binary (info subcommand)
+                       mel.cpp             — log-mel frontend
+                       encoder.cpp / conformer.cpp / relpos_attention.cpp
+                       ctc_decoder.cpp     — CTC head + greedy decode
+                       prediction.cpp      — stacked LSTM prediction net
+                       joint.cpp           — joint network
+                       tdt.cpp / rnnt.cpp  — TDT / RNNT greedy loops
+examples/cli/        parakeet-cli binary
+                       subcommands: info, transcribe, quantize
 scripts/             Python tooling
-                       convert_parakeet_to_gguf.py — .nemo/.hf → GGUF
+                       convert_parakeet_to_gguf.py — .nemo/.hf → GGUF (--dtype f32|f16|q8_0)
                        gen_nemo_baseline.py         — NeMo intermediates → baseline.gguf
+                       validate_vs_nemo.py          — WER parity gate vs NeMo
+                       publish_hf.py                — convert+quantize → HF upload (dry-run default)
                        requirements.txt             — nemo_toolkit[asr] + gguf
 tests/               ctest targets
-                       test_smoke.cpp       — version string (model-independent)
-                       test_audio_io.cpp    — wav load + resample (model-independent)
-                       test_model_loader.cpp — config + tensor map (model-dependent)
-                       python/check_convert.py   — converter round-trip (model-dependent)
-                       python/check_baseline.py  — baseline dumper (model-dependent)
-                       fixtures/clip.wav     — 2s 16k mono wav for baseline tests
+                       test_smoke.cpp           — version string (model-independent)
+                       test_audio_io.cpp        — wav load + resample (model-independent)
+                       test_fft.cpp             — FFT cross-check (model-independent)
+                       test_model_loader.cpp    — config + tensor map (model-dependent)
+                       test_capi.cpp            — C-API load → transcribe → free (model-dependent)
+                       test_transcribe_speech.cpp — end-to-end CTC transcript (model-dependent)
+                       test_transcribe_tdt.cpp  — TDT transcript on speech fixture (model-dependent)
+                       test_transcribe_0_6b.cpp — regression gate for 0.6B model (model-dependent)
+                       test_transcribe_ctc.cpp  — standalone CTC regression (model-dependent)
+                       test_transcribe_rnnt.cpp — RNNT regression (model-dependent)
+                       python/check_convert.py  — converter round-trip (model-dependent)
+                       python/check_baseline.py — baseline dumper (model-dependent)
+                       fixtures/clip.wav        — 2 s 16 kHz mono WAV for stage parity tests
+                       fixtures/speech.wav      — LibriSpeech 2086-149220-0033, ~7.4 s
 third_party/         vendored deps
                        ggml/      — submodule pinned at v0.13.0
                        dr_wav.h   — vendored single header
+models/              output dir for converted GGUFs (gitignored;
+                       MANIFEST.md tracks the expected published set)
 docs/
-  conversion.md      — full GGUF schema reference
+  conversion.md      — GGUF schema reference
+  quantization.md    — quantization allowlist, policy, measured size + WER per type
+  parity.md          — full model coverage matrix + per-stage tensor parity
   superpowers/       — spec and phase plans for agentic workers
+.github/workflows/
+  ci.yml             — build job (per-push) + closed-loop job (dispatch-only)
 ```
 
 ## Build
@@ -72,14 +103,15 @@ Use `-DGGML_NATIVE=OFF` when building for CI or portable binaries.
 ctest --test-dir build --output-on-failure -LE model
 ```
 
-Expected: `test_smoke`, `test_audio_io` PASS (2/2).
+Expected: `test_smoke`, `test_audio_io`, `test_fft` PASS.
 
 ### Model-dependent (need Python venv + cached checkpoint)
 
 ```
-# Convert the checkpoint first (see "Converting a model" below)
-PARAKEET_TEST_GGUF=/path/to/model.gguf ctest --test-dir build -R test_model_loader --output-on-failure
-ctest --test-dir build -L model --output-on-failure   # includes check_convert + check_baseline
+export PARAKEET_TEST_GGUF=/tmp/pk110m.gguf
+export PARAKEET_TEST_BASELINE=/tmp/baseline.gguf
+export PARAKEET_TEST_BASELINE_SPEECH=/tmp/baseline_speech.gguf
+ctest --test-dir build --output-on-failure
 ```
 
 Tests return exit code 77 (ctest SKIP) when the venv or checkpoint is absent,
@@ -87,17 +119,17 @@ so they never break a CI environment that lacks them.
 
 ### Test labels
 
-| Label   | Tests                                            | Needs         |
-| ------- | ------------------------------------------------ | ------------- |
-| (none)  | `test_smoke`, `test_audio_io`                    | nothing       |
-| `model` | `test_model_loader`, `check_convert`, `check_baseline` | venv + checkpoint |
+| Label   | Tests                                                        | Needs              |
+| ------- | ------------------------------------------------------------ | ------------------ |
+| (none)  | `test_smoke`, `test_audio_io`, `test_fft`                    | nothing            |
+| `model` | `test_model_loader`, `test_capi`, `test_transcribe_*`, `check_*` | venv + checkpoint  |
 
 ## Converting a model
 
 Set up the Python venv once:
 
 ```
-uv venv .venv --python 3.12
+python3 -m venv .venv
 .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
 .venv/bin/pip install -r scripts/requirements.txt   # nemo_toolkit[asr] + gguf
 ```
@@ -110,56 +142,136 @@ Convert (HuggingFace id or local `.nemo`):
 ```
 .venv/bin/python scripts/convert_parakeet_to_gguf.py \
     --model nvidia/parakeet-tdt_ctc-110m \
+    --dtype q8_0 \
     --output models/parakeet-tdt_ctc-110m.gguf
 ```
 
 Featurizer window and filterbank are lifted from the checkpoint at runtime;
 mel/fft parameters do not need to be specified manually.
 
+## Quantization policy
+
+See `docs/quantization.md` for the full policy. Summary:
+
+Only **linear `ggml_mul_mat`-consumed weights** are quantized:
+- Encoder per-layer FFN + attention projections (`feed_forward*.linear*.weight`,
+  `self_attn.linear_{q,k,v,out,pos}.weight`)
+- Subsampling output projection (`encoder.pre_encode.out.weight`)
+- Joint enc/pred projections (`joint.enc.weight`, `joint.pred.weight`)
+
+Everything else stays F32: conv kernels, LSTM weights/biases, mel featurizer,
+batch_norm stats, LayerNorm gain/bias, all `*.bias`, pos_bias, embeddings, the
+joint output projection (`joint.joint_net.2.weight` — hand-rolled loop), and the
+CTC head (stored `[1, V]`, block quantization impossible without transpose).
+
+Supported `--dtype` values for the converter: `f32` (default), `f16`, `q8_0`.
+
+For K-quants (`q4_k`, `q5_k`, `q6_k`), re-quantize an F32 GGUF with the CLI:
+
+```
+parakeet-cli quantize <in.gguf> <out.gguf> <type>
+```
+
+All variants of the 110m anchor hold WER 0.0 vs NeMo at F16, Q8_0, Q6_K, and
+Q4_K. See `docs/quantization.md` for size figures.
+
+## CLI
+
+The binary is at `build/examples/cli/parakeet-cli`.
+
+```
+parakeet-cli info <model.gguf>
+parakeet-cli transcribe --model <model.gguf> --input <audio.wav> [--decoder ctc|tdt]
+parakeet-cli quantize <in.gguf> <out.gguf> <type>
+```
+
+## C-API and LocalAI integration
+
+`include/parakeet_capi.h` defines the flat C-API.  Build `libparakeet.so` with
+`-DPARAKEET_SHARED=ON`.  Verify exports with `nm -D build-shared/libparakeet.so | grep parakeet_capi`.
+
+The LocalAI backend lives in the LocalAI repo and dlopens `libparakeet.so`.
+Symbols the LocalAI side depends on — do not remove or change any signature
+without a coordinated bump on the LocalAI side:
+
+```
+parakeet_capi_abi_version
+parakeet_capi_load
+parakeet_capi_free
+parakeet_capi_transcribe_path
+parakeet_capi_transcribe_pcm
+parakeet_capi_free_string
+parakeet_capi_last_error
+```
+
+`parakeet_capi_abi_version` returns an integer that LocalAI can check for
+compatibility; bump it on any breaking change to the above signatures or
+semantics. Additive changes (new functions) are fine without bumping.
+
 ## Dumping NeMo baselines
 
-Used by Phase 1 parity tests.  Requires the venv and a 16k mono WAV.
+Used by Phase 1 parity tests.  Requires the venv and a 16 kHz mono WAV.
 
 ```
 .venv/bin/python scripts/gen_nemo_baseline.py \
     --model nvidia/parakeet-tdt_ctc-110m \
     --audio tests/fixtures/clip.wav \
     --output /tmp/baseline.gguf
+.venv/bin/python scripts/gen_nemo_baseline.py \
+    --model nvidia/parakeet-tdt_ctc-110m \
+    --audio tests/fixtures/speech.wav \
+    --output /tmp/baseline_speech.gguf
 ```
 
-## CLI
+## Publishing models to HuggingFace
 
-The binary is at `build/examples/cli/parakeet-cli` (no `build/bin`).
+`scripts/publish_hf.py` converts the anchor to the full variant set (F16,
+Q8_0, Q4_K) and uploads each to a HF repo.  Dry-run by default — add `--upload`
+to actually push.  Requires an HF token at `~/.cache/huggingface/token`
+(`huggingface-cli login`).
 
 ```
-build/examples/cli/parakeet-cli info models/parakeet-tdt_ctc-110m.gguf
+.venv/bin/python scripts/publish_hf.py \
+    --model nvidia/parakeet-tdt_ctc-110m \
+    --repo mudler/parakeet.cpp-110m
+# add --upload to actually push
 ```
 
-Prints the full config block: arch, encoder dims, mel parameters, vocab size,
-TDT durations, etc.
+See `models/MANIFEST.md` for the expected set of published GGUFs per checkpoint.
+
+## CI workflow
+
+`.github/workflows/ci.yml` has two jobs:
+
+1. **build** (runs on every push + pull_request): cmake configure + build +
+   `ctest -LE model`.  Fast (no model, no Python env needed).  This is the
+   per-push gate.
+
+2. **closed-loop** (runs ONLY on `workflow_dispatch` — manual trigger): sets up
+   the Python venv, installs CPU torch + `scripts/requirements.txt`, builds the
+   project, converts `nvidia/parakeet-tdt_ctc-110m` to GGUF (~440 MB download),
+   runs `parakeet-cli transcribe --decoder tdt` on `tests/fixtures/speech.wav`,
+   and asserts the output is byte-for-byte identical to the committed NeMo TDT
+   reference transcript.  Fails the job on any mismatch.  Not triggered on push
+   because it needs network + model.
 
 ## GGUF schema
 
 See `docs/conversion.md` for the authoritative schema.  Quick summary:
 
 - `general.architecture = "parakeet"`
-- All metadata keys use the `parakeet.*` prefix (e.g.
-  `parakeet.arch`, `parakeet.encoder.d_model`, `parakeet.preprocessor.n_mels`).
+- All metadata keys use the `parakeet.*` prefix.
 - **Tensor names are verbatim NeMo `state_dict` keys** — no remapping, no
-  prefix stripping.  The two featurizer buffers (`preprocessor.featurizer.fb`,
-  `preprocessor.featurizer.window`) are included explicitly; all other
-  preprocessor internals are skipped.
-- This verbatim convention is load-bearing: the C++ model loader maps
-  `name → ggml_tensor*` by exact string, and the Phase 1 inference code calls
-  `ml.tensor("encoder.layers.0.norm_feed_forward1.weight")` etc.  Never remap
-  tensor names at conversion time.
+  prefix stripping.  This convention is load-bearing: the C++ model loader maps
+  `name → ggml_tensor*` by exact string.  Never remap tensor names at
+  conversion time.
 
 ## ggml submodule
 
 Pinned at v0.13.0 in `third_party/ggml`.  No local patches.  To bump:
 1. Update the submodule SHA.
 2. Run `ctest --test-dir build --output-on-failure`.
-3. Fix any API breakage in `src/model_loader.cpp` (gguf/ggml C API).
+3. Fix any API breakage in `src/model_loader.cpp`.
 
 ## Spec and phase plans
 
@@ -167,5 +279,38 @@ Pinned at v0.13.0 in `third_party/ggml`.  No local patches.  To bump:
 - Phase plans: `docs/superpowers/plans/`
 
 Fresh agents should read the spec (especially §2.1 config, §7 GGUF schema,
-§8 Python env) and the current phase plan before starting work.  Each phase
-plan has an Orientation section and an entry-gate checklist.
+§8 Python env, §10 C-API/build) and the current phase plan before starting
+work.  Each phase plan has an Orientation section and an entry-gate checklist.
+
+## Common maintenance tasks
+
+### Add support for a new Parakeet checkpoint
+
+1. Convert + run `parakeet-cli info` to inspect the GGUF metadata.
+2. Run `scripts/validate_vs_nemo.py` to get a WER figure.
+3. If it passes (WER 0), add a row to `docs/parity.md` and `models/MANIFEST.md`.
+
+The C++ loader is metadata-driven (arch, d_model, layers, mel params, vocab,
+pred LSTM layers, xscaling, optional biases all read from GGUF KV); no source
+changes are typically needed.
+
+### Update to a newer NeMo version
+
+1. Bump the venv and re-run the converter on the anchor checkpoint.
+2. Regenerate baselines via `scripts/gen_nemo_baseline.py`.
+3. Run the full test suite.  Any parity drift will surface in the `test_*`
+   targets.
+
+### Update to a newer ggml
+
+1. Update the submodule SHA.
+2. Run `ctest --output-on-failure`.
+3. Fix any API breakage in `src/model_loader.cpp` (gguf/ggml C API).
+
+### Add a new quantization type
+
+1. Extend `examples/cli/main.cpp` `cmd_quantize` with the new type mapping.
+2. Update the `should_quantize` heuristic in `scripts/convert_parakeet_to_gguf.py`
+   if the new type has a different block size requirement.
+3. Run `scripts/validate_vs_nemo.py` on the quantized GGUF and record WER + size
+   in `docs/quantization.md`.
