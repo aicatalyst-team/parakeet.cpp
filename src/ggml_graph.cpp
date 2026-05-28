@@ -2,14 +2,28 @@
 #include "common.hpp"
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
 namespace pk {
 
+// Process-global compute-thread override. 0 == unset (honor the caller's
+// per-call n_threads). Atomic so it is safe to set from one thread and read
+// from the compute path; the benchmark CLI sets it once before any inference.
+static std::atomic<int> g_num_threads{0};
+
+void set_num_threads(int n) { g_num_threads.store(n < 0 ? 0 : n, std::memory_order_relaxed); }
+int  num_threads()          { return g_num_threads.load(std::memory_order_relaxed); }
+
 bool run_graph(size_t mem_bytes, int n_threads,
                const std::function<ggml_tensor*(ggml_context*)>& build,
                std::vector<float>& out) {
+    // A positive process-global override wins over the caller's per-call value
+    // so a single `--threads N` controls every graph computation. When unset
+    // (0), the caller's n_threads is used unchanged (default behavior).
+    const int g = g_num_threads.load(std::memory_order_relaxed);
+    if (g > 0) n_threads = g;
     // Initialise a fixed-size context with inline tensor storage (no_alloc=false).
     struct ggml_init_params params = {
         /* .mem_size   = */ mem_bytes,

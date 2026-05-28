@@ -5,8 +5,11 @@
 #include "audio_io.hpp"
 #include "streaming.hpp"
 #include "transcription.hpp"
+#include "ggml_graph.hpp"   // pk::set_num_threads
 #include "ggml.h"
 #include "gguf.h"
+#include <chrono>
+#include <fstream>
 #include <memory>
 #include <algorithm>
 #include <cctype>
@@ -406,18 +409,233 @@ static int cmd_quantize(int argc, char** argv) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// bench: clean per-file transcription timing for the NeMo-vs-ours benchmark.
+//
+// Loads the model ONCE (timed -> load_ms), then for each audio path in a
+// manifest: loads the WAV, computes audio_sec = samples/16000, and times ONLY
+// pk::Model::transcribe_path (steady_clock, ms). Emits a single JSON document
+// so the Python runner can compute RTFx (audio_sec / proc_sec) fairly without
+// the one-time model-load cost polluting the per-file numbers.
+//
+// --threads N controls the ggml compute threads for EVERY graph computation
+// (via pk::set_num_threads, read inside pk::run_graph). When unset we leave the
+// process-global override clear so the components' built-in default is used.
+// ---------------------------------------------------------------------------
+
+// Append `s` to `out` as a JSON string literal (quoted), escaping per RFC 8259.
+// Mirrors append_json_string in src/parakeet_capi.cpp (UTF-8 >= 0x80 passes
+// through verbatim).
+static void bench_json_string(std::string& out, const std::string& s) {
+    out += '"';
+    char esc[8];
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    std::snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
+                    out += esc;
+                } else {
+                    out += (char)c;
+                }
+        }
+    }
+    out += '"';
+}
+
+// Reads one audio path per line from the manifest. Blank lines and lines whose
+// first non-space char is '#' are ignored. A tab-separated `path\tref` line is
+// accepted -- only the first field (the path) is taken. Leading/trailing
+// whitespace on the path field is trimmed.
+static std::vector<std::string> read_manifest(const std::string& path, bool& ok) {
+    std::vector<std::string> out;
+    std::ifstream f(path);
+    if (!f) { ok = false; return out; }
+    ok = true;
+    std::string line;
+    while (std::getline(f, line)) {
+        // Strip a trailing CR (CRLF manifests).
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        // First field only (tab-separated path\tref is allowed).
+        size_t tab = line.find('\t');
+        std::string p = (tab == std::string::npos) ? line : line.substr(0, tab);
+        // Trim surrounding whitespace.
+        size_t b = p.find_first_not_of(" \t");
+        if (b == std::string::npos) continue;                 // blank
+        size_t e = p.find_last_not_of(" \t");
+        p = p.substr(b, e - b + 1);
+        if (p.empty() || p[0] == '#') continue;               // blank / comment
+        out.push_back(p);
+    }
+    return out;
+}
+
+static int cmd_bench(int argc, char** argv) {
+    std::string model, manifest, decoder_str, json_out;
+    int threads = 0;  // 0 == unset -> use the components' built-in default
+    for (int i = 0; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+            model = argv[++i];
+        } else if (std::strcmp(argv[i], "--manifest") == 0 && i + 1 < argc) {
+            manifest = argv[++i];
+        } else if (std::strcmp(argv[i], "--decoder") == 0 && i + 1 < argc) {
+            decoder_str = argv[++i];
+        } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            threads = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--json") == 0 && i + 1 < argc) {
+            json_out = argv[++i];
+        }
+    }
+    if (model.empty() || manifest.empty()) {
+        std::fprintf(stderr,
+            "usage: parakeet-cli bench --model <m.gguf> --manifest <file> "
+            "[--decoder ctc|tdt] [--threads N] [--json <out>]\n");
+        return 2;
+    }
+
+    // Resolve the decoder selector (matches `transcribe`).
+    pk::Decoder dec = pk::Decoder::kDefault;
+    if (!decoder_str.empty()) {
+        if (decoder_str == "ctc") {
+            dec = pk::Decoder::kCTC;
+        } else if (decoder_str == "tdt") {
+            dec = pk::Decoder::kTDT;
+        } else {
+            std::fprintf(stderr,
+                "parakeet-cli bench: unknown --decoder '%s' (want ctc|tdt)\n",
+                decoder_str.c_str());
+            return 2;
+        }
+    }
+
+    // Apply the thread count to EVERY ggml graph computation. When --threads is
+    // omitted we report the components' built-in default in the JSON so the
+    // runner records the thread count that was actually used.
+    int reported_threads = threads;
+    if (threads > 0) {
+        pk::set_num_threads(threads);
+    } else {
+        reported_threads = 4;  // the per-call default the components pass
+    }
+
+    bool man_ok = false;
+    std::vector<std::string> paths = read_manifest(manifest, man_ok);
+    if (!man_ok) {
+        std::fprintf(stderr, "parakeet-cli bench: failed to read manifest %s\n",
+                     manifest.c_str());
+        return 1;
+    }
+    if (paths.empty()) {
+        std::fprintf(stderr, "parakeet-cli bench: manifest %s has no audio paths\n",
+                     manifest.c_str());
+        return 1;
+    }
+
+    using clock = std::chrono::steady_clock;
+    auto ms_since = [](clock::time_point t0) {
+        return std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+    };
+
+    // Load the model ONCE -- timed, and excluded from per-file proc_ms.
+    auto t_load = clock::now();
+    std::unique_ptr<pk::Model> m = pk::Model::load(model);
+    double load_ms = ms_since(t_load);
+    if (!m) {
+        std::fprintf(stderr, "parakeet-cli bench: failed to load model %s\n",
+                     model.c_str());
+        return 1;
+    }
+
+    struct FileResult { std::string path; double audio_sec; double proc_ms; std::string text; };
+    std::vector<FileResult> results;
+    results.reserve(paths.size());
+
+    for (const std::string& p : paths) {
+        pk::Audio audio;
+        if (!pk::load_audio_16k_mono(p, audio)) {
+            std::fprintf(stderr, "parakeet-cli bench: failed to load audio %s\n",
+                         p.c_str());
+            return 1;
+        }
+        // audio_sec from the decoded 16 kHz sample count.
+        double audio_sec = (double)audio.samples.size() / 16000.0;
+
+        // Time ONLY the transcription (model already loaded).
+        auto t_proc = clock::now();
+        std::string text;
+        try {
+            text = m->transcribe_pcm(audio.samples, 16000, dec);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "parakeet-cli bench: transcribe failed on %s: %s\n",
+                         p.c_str(), e.what());
+            return 1;
+        }
+        double proc_ms = ms_since(t_proc);
+        results.push_back({p, audio_sec, proc_ms, text});
+    }
+
+    // Hand-roll the JSON document.
+    std::string out;
+    out.reserve(256 + results.size() * 128);
+    out += "{\"model\":";
+    bench_json_string(out, model);
+    char numbuf[64];
+    std::snprintf(numbuf, sizeof(numbuf), ",\"threads\":%d", reported_threads);
+    out += numbuf;
+    std::snprintf(numbuf, sizeof(numbuf), ",\"load_ms\":%.3f", load_ms);
+    out += numbuf;
+    out += ",\"files\":[";
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (i) out += ',';
+        out += "{\"path\":";
+        bench_json_string(out, results[i].path);
+        std::snprintf(numbuf, sizeof(numbuf), ",\"audio_sec\":%.6f", results[i].audio_sec);
+        out += numbuf;
+        std::snprintf(numbuf, sizeof(numbuf), ",\"proc_ms\":%.3f", results[i].proc_ms);
+        out += numbuf;
+        out += ",\"text\":";
+        bench_json_string(out, results[i].text);
+        out += '}';
+    }
+    out += "]}";
+
+    if (!json_out.empty()) {
+        std::ofstream of(json_out, std::ios::binary | std::ios::trunc);
+        if (!of) {
+            std::fprintf(stderr, "parakeet-cli bench: failed to write %s\n",
+                         json_out.c_str());
+            return 1;
+        }
+        of << out << '\n';
+    } else {
+        std::printf("%s\n", out.c_str());
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc >= 3 && std::strcmp(argv[1], "info") == 0) return cmd_info(argv[2]);
     if (argc >= 2 && std::strcmp(argv[1], "transcribe") == 0)
         return cmd_transcribe(argc - 2, argv + 2);
     if (argc >= 2 && std::strcmp(argv[1], "quantize") == 0)
         return cmd_quantize(argc - 2, argv + 2);
+    if (argc >= 2 && std::strcmp(argv[1], "bench") == 0)
+        return cmd_bench(argc - 2, argv + 2);
     std::fprintf(stderr,
         "usage:\n"
         "  parakeet-cli info <model.gguf>\n"
         "  parakeet-cli transcribe --model <model.gguf> --input <wav> "
         "[--decoder ctc|tdt] [--stream] [--timestamps] [--json]\n"
         "  parakeet-cli quantize <in.gguf> <out.gguf> "
-        "<q4_0|q5_0|q8_0|q4_k|q5_k|q6_k>\n");
+        "<q4_0|q5_0|q8_0|q4_k|q5_k|q6_k>\n"
+        "  parakeet-cli bench --model <model.gguf> --manifest <file> "
+        "[--decoder ctc|tdt] [--threads N] [--json <out>]\n");
     return 2;
 }

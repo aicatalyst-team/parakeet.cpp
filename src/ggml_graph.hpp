@@ -19,4 +19,18 @@ bool run_graph(size_t mem_bytes, int n_threads,
                const std::function<ggml_tensor*(ggml_context*)>& build,
                std::vector<float>& out);
 
+// Process-global override for the ggml compute thread count.
+//
+// `run_graph` reads this override and, when it has been explicitly set to a
+// positive value, uses it in place of the per-call `n_threads` argument that
+// the components pass. This lets a single `--threads N` switch control EVERY
+// graph computation (the encoder is the bulk) without threading a thread-count
+// parameter through every component.
+//
+// The default (0 == "unset") means: honor whatever `n_threads` each caller
+// passes. So existing behavior — and the test suite, which never sets this —
+// is unchanged. Setting it back to 0 clears the override.
+void set_num_threads(int n);
+int  num_threads();  // current override (0 == unset)
+
 } // namespace pk
