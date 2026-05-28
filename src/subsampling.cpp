@@ -33,11 +33,12 @@ Subsampling::Subsampling(const ModelLoader& ml)
     causal_        = ml.config().causal_downsampling;
 }
 
-int Subsampling::valid_out_len(int T) const {
-    // The mel has T spatial frames, but the preprocessor reports a valid length
-    // of T-1 (center-padding adds one extra trailing frame). Each of the three
-    // stride-2, k=3 conv stages reduces the valid length via NeMo's calc_length:
-    // out = floor((in + all_paddings - k)/s) + 1, where all_paddings = left+right.
+int Subsampling::valid_out_len(int T, int in_valid_frames) const {
+    // The mel has T spatial frames, but the OFFLINE preprocessor reports a valid
+    // length of T-1 (center-padding adds one extra trailing frame). Each of the
+    // three stride-2, k=3 conv stages reduces the valid length via NeMo's
+    // calc_length: out = floor((in + all_paddings - k)/s) + 1, all_paddings =
+    // left+right.
     //
     // Non-causal (offline): symmetric pad (k-1)/2 each side -> all_paddings = 2.
     //   out = floor((in + 2 - 3)/2) + 1 = (in - 1)/2 + 1  (matches existing path).
@@ -45,8 +46,11 @@ int Subsampling::valid_out_len(int T) const {
     //   all_paddings = 3.  out = floor((in + 3 - 3)/2) + 1 = floor(in/2) + 1.
     // NeMo's calc_length runs in float; for these integer inputs floor matches
     // integer division, so we use integer arithmetic directly.
+    //
+    // Streaming (in_valid_frames >= 0): the chunk window is fully real audio, so
+    // the entry valid length is the supplied count (typically T), NOT T-1.
     const int all_paddings = causal_ ? 3 : 2;
-    int valid = T - 1;
+    int valid = (in_valid_frames >= 0) ? in_valid_frames : (T - 1);
     for (int st = 0; st < 3; ++st)            // conv0, conv2, conv5
         valid = (valid + all_paddings - 3) / 2 + 1;
     return valid;
@@ -55,12 +59,18 @@ int Subsampling::valid_out_len(int T) const {
 void Subsampling::forward(const std::vector<float>& mel, int n_mels, int T,
                           std::vector<float>& out, int& Tout, int& d_model) const {
     int valid_len_unused = 0;
-    forward(mel, n_mels, T, out, Tout, d_model, valid_len_unused);
+    forward(mel, n_mels, T, out, Tout, d_model, valid_len_unused, -1);
 }
 
 void Subsampling::forward(const std::vector<float>& mel, int n_mels, int T,
                           std::vector<float>& out, int& Tout, int& d_model,
                           int& valid_len) const {
+    forward(mel, n_mels, T, out, Tout, d_model, valid_len, -1);
+}
+
+void Subsampling::forward(const std::vector<float>& mel, int n_mels, int T,
+                          std::vector<float>& out, int& Tout, int& d_model,
+                          int& valid_len, int in_valid_frames) const {
     const int C = conv_channels_;
     const int F = n_mels;            // feature dim (80)
 
@@ -121,8 +131,10 @@ void Subsampling::forward(const std::vector<float>& mel, int n_mels, int T,
                 return ggml_mul(ctx, t, tm); // broadcast over ne0(W), ne2(C), ne3
             };
             // Per-stage valid time lengths (NeMo calc_length on the time axis).
-            // Stage entry length: T-1 (preprocessor valid mel len). all_paddings=3.
-            int valid_t0 = T - 1;                       // before stage 0
+            // Stage entry length: offline = T-1 (preprocessor center-pad valid mel
+            // len); streaming = in_valid_frames (whole chunk window is real audio).
+            // all_paddings = 3 (causal).
+            int valid_t0 = (in_valid_frames >= 0) ? in_valid_frames : (T - 1); // before stage 0
             int valid_t1 = (valid_t0 + 3 - 3) / 2 + 1;  // before stage 2 (after stage 0)
             int valid_t2 = (valid_t1 + 3 - 3) / 2 + 1;  // before stage 5 (after stage 2)
 
@@ -197,7 +209,7 @@ void Subsampling::forward(const std::vector<float>& mel, int n_mels, int T,
             // never read masked input frames (kernel reach stays inside the valid
             // region), so we can run the conv stack spatially and zero the
             // flattened conv output at frames >= valid_out_len before the Linear.
-            const int valid_out = valid_out_len(T);
+            const int valid_out = valid_out_len(T, in_valid_frames);
             if (valid_out < Tp) {
                 // Multiply by a time mask [1, T'] (1.0 valid, 0.0 masked), which
                 // broadcasts over the C*F' feature dim. Must be applied in-graph
@@ -225,7 +237,7 @@ void Subsampling::forward(const std::vector<float>& mel, int n_mels, int T,
     // Output geometry: T' from conv reductions, d_model from config.
     Tout = (int)out.size() / d_model_;
     d_model = d_model_;
-    valid_len = valid_out_len(T);
+    valid_len = valid_out_len(T, in_valid_frames);
     if (valid_len > Tout) valid_len = Tout;
 }
 

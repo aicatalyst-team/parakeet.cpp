@@ -36,6 +36,7 @@ set(PARAKEET_SRC
     src/conformer.cpp
     src/pos_enc.cpp
     src/encoder.cpp
+    src/streaming_encoder.cpp
     src/ctc_decoder.cpp
     src/prediction.cpp
     src/joint.cpp

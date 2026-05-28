@@ -17,6 +17,7 @@ pk_add_test(test_conformer)
 pk_add_test(test_conv_eou)
 pk_add_test(test_encoder)
 pk_add_test(test_encoder_eou)
+pk_add_test(test_streaming_encoder)
 pk_add_test(test_ctc)
 pk_add_test(test_prediction)
 pk_add_test(test_prediction_step)
@@ -33,7 +34,8 @@ pk_add_test(test_transcribe_rnnt)
 pk_add_test(test_transcribe_eou)
 pk_add_test(test_capi)
 set_tests_properties(test_model_loader test_mel test_subsampling test_relpos_attention
-                     test_conformer test_conv_eou test_encoder test_encoder_eou test_ctc test_prediction
+                     test_conformer test_conv_eou test_encoder test_encoder_eou
+                     test_streaming_encoder test_ctc test_prediction
                      test_prediction_step
                      test_joint test_transducer_core test_tdt_greedy test_tokenizer test_transcribe
                      test_transcribe_speech test_transcribe_tdt test_transcribe_0_6b
@@ -41,7 +43,8 @@ set_tests_properties(test_model_loader test_mel test_subsampling test_relpos_att
                      PROPERTIES LABELS "model")
 # These tests read fixtures/baselines via paths relative to the project root.
 set_tests_properties(test_mel test_subsampling test_relpos_attention test_conformer
-                     test_conv_eou test_encoder test_encoder_eou test_ctc test_prediction test_prediction_step
+                     test_conv_eou test_encoder test_encoder_eou test_streaming_encoder
+                     test_ctc test_prediction test_prediction_step
                      test_joint
                      test_transducer_core test_tdt_greedy test_tokenizer test_transcribe
                      test_transcribe_speech test_transcribe_tdt test_transcribe_0_6b
