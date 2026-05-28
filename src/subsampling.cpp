@@ -30,8 +30,26 @@ Subsampling::Subsampling(const ModelLoader& ml)
     d_model_       = (int)ml.config().d_model;
 }
 
+int Subsampling::valid_out_len(int T) const {
+    // The mel has T spatial frames, but the preprocessor reports a valid length
+    // of T-1 (center-padding adds one extra trailing frame). Each of the three
+    // stride-2, k=3, p=1 conv stages reduces the valid length via NeMo's
+    // calc_length: out = (in + 2*p - k)/s + 1.
+    int valid = T - 1;
+    for (int st = 0; st < 3; ++st)            // conv0, conv2, conv5
+        valid = (valid + 2 - 3) / 2 + 1;
+    return valid;
+}
+
 void Subsampling::forward(const std::vector<float>& mel, int n_mels, int T,
                           std::vector<float>& out, int& Tout, int& d_model) const {
+    int valid_len_unused = 0;
+    forward(mel, n_mels, T, out, Tout, d_model, valid_len_unused);
+}
+
+void Subsampling::forward(const std::vector<float>& mel, int n_mels, int T,
+                          std::vector<float>& out, int& Tout, int& d_model,
+                          int& valid_len) const {
     const int C = conv_channels_;
     const int F = n_mels;            // feature dim (80)
 
@@ -114,10 +132,7 @@ void Subsampling::forward(const std::vector<float>& mel, int n_mels, int T,
             // never read masked input frames (kernel reach stays inside the valid
             // region), so we can run the conv stack spatially and zero the
             // flattened conv output at frames >= valid_out_len before the Linear.
-            int valid_in = T - 1;
-            for (int st = 0; st < 3; ++st)             // conv0, conv2, conv5 (stride 2, k=3, p=1)
-                valid_in = (valid_in + 2 - 3) / 2 + 1; // == calc_length per stage
-            const int valid_out = valid_in;
+            const int valid_out = valid_out_len(T);
             if (valid_out < Tp) {
                 // Multiply by a time mask [1, T'] (1.0 valid, 0.0 masked), which
                 // broadcasts over the C*F' feature dim. Must be applied in-graph
@@ -145,6 +160,8 @@ void Subsampling::forward(const std::vector<float>& mel, int n_mels, int T,
     // Output geometry: T' from conv reductions, d_model from config.
     Tout = (int)out.size() / d_model_;
     d_model = d_model_;
+    valid_len = valid_out_len(T);
+    if (valid_len > Tout) valid_len = Tout;
 }
 
 } // namespace pk
