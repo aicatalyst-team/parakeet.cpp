@@ -254,6 +254,12 @@ def main():
         jn = _get(cfg.joint, "jointnet", {}) or {}
         w.add_uint32("parakeet.joint.joint_hidden", int(_get(jn, "joint_hidden")))
         w.add_string("parakeet.joint.activation", str(_get(jn, "activation", "relu")))
+        # Greedy max symbols emitted per frame (NeMo decoding.greedy.max_symbols;
+        # default 10). Emitted so the C++ decoder honors a model's own value
+        # instead of a hardcoded literal.
+        greedy = _get(_get(cfg, "decoding", {}) or {}, "greedy", {}) or {}
+        max_sym = _get(greedy, "max_symbols", _get(greedy, "max_symbols_per_step", 10))
+        w.add_uint32("parakeet.decoding.max_symbols", int(max_sym) if max_sym is not None else 10)
     if arch in ("tdt", "hybrid_tdt_ctc"):
         durs = (_get(_get(cfg, "decoding", {}) or {}, "durations")
                 or _get(_get(cfg, "model_defaults", {}) or {}, "tdt_durations"))

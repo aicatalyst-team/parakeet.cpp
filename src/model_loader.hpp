@@ -41,6 +41,7 @@ struct ParakeetConfig {
     uint32_t pred_hidden=0, pred_rnn_layers=0, joint_hidden=0;
     std::string joint_activation;
     std::vector<int32_t> tdt_durations;
+    uint32_t max_symbols=10;  // greedy max symbols per frame (NeMo default 10)
     // vocab
     uint32_t vocab_size=0, blank_id=0;
     std::vector<std::string> tokenizer_pieces;

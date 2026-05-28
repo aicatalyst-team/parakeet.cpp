@@ -77,6 +77,7 @@ bool ModelLoader::load(const std::string& path){
     cfg_.pred_rnn_layers = kv_u32(gguf_, "parakeet.decoder.pred_rnn_layers");
     cfg_.joint_hidden = kv_u32(gguf_, "parakeet.joint.joint_hidden");
     cfg_.joint_activation = kv_str(gguf_, "parakeet.joint.activation");
+    cfg_.max_symbols = kv_u32(gguf_, "parakeet.decoding.max_symbols", 10);
     cfg_.vocab_size  = kv_u32(gguf_, "parakeet.vocab_size");
     cfg_.blank_id    = kv_u32(gguf_, "parakeet.blank_id");
     // durations array (stored as INT32 by the converter)

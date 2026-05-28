@@ -11,9 +11,9 @@ StreamingSession::StreamingSession(const ModelLoader& ml)
     const ParakeetConfig& cfg = ml.config();
     d_model_  = (int)cfg.d_model;
     blank_id_ = (int)cfg.blank_id;
-    // NeMo's greedy default of 10 symbols per frame (the converter does not emit
-    // this value; matches the offline pk::transcribe path in model.cpp).
-    max_symbols_ = 10;
+    // Greedy max symbols per frame, from model metadata (NeMo default 10);
+    // matches the offline pk::transcribe path in model.cpp.
+    max_symbols_ = (int)cfg.max_symbols;
     assert(joint_.num_durations() == 0 && "StreamingSession is RNN-T only (no TDT durations)");
 
     // Resolve the <EOU>/<EOB> special token ids from the tokenizer pieces (do

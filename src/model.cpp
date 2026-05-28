@@ -69,9 +69,9 @@ std::string Model::transcribe_16k(const std::vector<float>& pcm16k,
         PredictionNet pred(loader_);
         Joint        joint(loader_);
 
-        // max_symbols: use NeMo's default of 10 (the converter does not currently
-        // emit this value; if/when it does the config could be read here).
-        const int max_symbols = 10;
+        // max_symbols: greedy max symbols emitted per frame, read from the model
+        // metadata (parakeet.decoding.max_symbols; NeMo default 10).
+        const int max_symbols = static_cast<int>(cfg.max_symbols);
 
         // Branch on the duration table: TDT (durations present) uses the
         // duration-aware greedy loop; a pure RNNT transducer (no durations, e.g.
