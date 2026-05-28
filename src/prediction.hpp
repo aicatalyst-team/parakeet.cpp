@@ -5,6 +5,12 @@
 
 namespace pk {
 
+// Carries the LSTM hidden and cell state for stateful single-step decoding.
+struct PredState {
+    std::vector<float> h; // [hidden]
+    std::vector<float> c; // [hidden]
+};
+
 // RNN-Transducer prediction network — NeMo RNNTDecoder prediction net.
 //
 // Architecture:
@@ -40,12 +46,33 @@ public:
     void forward(const std::vector<int32_t>& ids, bool add_sos,
                  std::vector<float>& out, int& U_out, int& hidden) const;
 
+    // Returns a zero-initialised LSTM state (h and c each [hidden] zeros).
+    PredState zero_state() const;
+
+    // Advance the LSTM by one token.
+    // token_id: embedding index (ignored when is_sos=true).
+    // is_sos:   use the zero SOS input vector instead of the embedding.
+    // in:       previous (h, c) state (use zero_state() for the first call).
+    // g:        output — the new h' vector [hidden].
+    // out_state: the new (h', c') state to carry to the next step.
+    void step(int32_t token_id, bool is_sos,
+              const PredState& in,
+              std::vector<float>& g,
+              PredState& out_state) const;
+
     int hidden_size() const { return H_; }
 
 private:
     const ModelLoader& ml_;
     int H_;       // pred_hidden
     int vocab_p1_; // vocab + 1 (embedding rows)
+
+    // Single LSTM cell step shared by forward() and step().
+    // x[H]: input embedding; h_in[H], c_in[H]: previous state.
+    // h_out[H], c_out[H]: new state (written in-place).
+    void lstm_cell(const float* x,
+                   const float* h_in, const float* c_in,
+                   float* h_out, float* c_out) const;
 };
 
 } // namespace pk
