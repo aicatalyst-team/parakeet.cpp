@@ -70,5 +70,21 @@ required = [
 for req in required:
     assert req in names, f"missing baseline tensor {req}"
 
-print("check_baseline OK:", sorted(names))
+# Phase 3 TDT greedy ground truth. The token-count KV is ALWAYS present; the
+# `tdt_token_ids` tensor only exists when non-empty (gguf cannot store a
+# zero-length tensor). The tone fixture (clip.wav) decodes to an empty sequence,
+# so the tensor is legitimately absent there — assert consistency, not presence.
+field = reader.get_field("baseline.tdt_token_count")
+assert field is not None, "missing baseline.tdt_token_count KV"
+tdt_count = int(field.parts[field.data[0]][0])
+if tdt_count > 0:
+    assert "tdt_token_ids" in names, (
+        f"tdt_token_count={tdt_count} but tdt_token_ids tensor is missing"
+    )
+else:
+    assert "tdt_token_ids" not in names, (
+        "tdt_token_count==0 but a tdt_token_ids tensor is present"
+    )
+
+print(f"check_baseline OK (tdt_token_count={tdt_count}):", sorted(names))
 sys.exit(0)

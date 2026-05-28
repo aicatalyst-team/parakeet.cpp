@@ -71,10 +71,23 @@ prediction net, ``m.joint`` = ``RNNTJoint`` TDT joint):
                                            used for ``joint_out`` (= 4). The C++
                                            joint test feeds ``encoder_out[:, :N]``.
 
+TDT greedy ground truth (Phase 3; ``m`` with the transducer/TDT head selected):
+
+* ``tdt_token_ids``    ``[L]`` int32        NeMo's TDT-head greedy decoded
+                                            token-id sequence (``hyp.y_sequence``)
+                                            for the clip. Captured by selecting
+                                            the transducer head
+                                            (``change_decoding_strategy(decoder_type='rnnt')``
+                                            — for this hybrid the transducer head
+                                            IS the TDT decoder) and running
+                                            ``m.transcribe([audio])``. May be
+                                            length-0 for a silent / tone clip.
+
 String KVs:
 
 * ``baseline.detok_text``  detokenized text for the ``detok_ids`` fixture
 * ``baseline.ctc_text``    authoritative NeMo CTC greedy transcript of the clip
+* ``baseline.tdt_text``    authoritative NeMo TDT-head greedy transcript of the clip
 
 Exit codes (ctest convention): 0 = ok, 2 = deps/model unavailable, 1 = fail.
 """
@@ -316,6 +329,26 @@ def main():
     cap["joint_out"] = jout.detach().cpu().float().numpy()  # [1, N, U+1, 1030]
     joint_enc_frames_arr = np.array([n_frames], dtype=np.int32)
 
+    # ---- TDT greedy ground truth (Phase 3) ----
+    # Select the transducer head (for this hybrid the transducer head IS the TDT
+    # decoder) and run the model's own greedy decode to capture the reference
+    # token-id sequence. change_decoding_strategy(decoder_type='rnnt') sets
+    # cur_decoder='rnnt'; transcribe() then runs the TDT greedy path. We capture
+    # hyp.y_sequence (the emitted token ids) — this is the EXACT sequence the C++
+    # pk::tdt_greedy loop must reproduce. For a tone/silent clip the sequence may
+    # be empty (length 0), which is fine.
+    m.change_decoding_strategy(decoder_type="rnnt")
+    assert m.cur_decoder == "rnnt", f"expected RNNT/TDT decoder, got {m.cur_decoder}"
+    with torch.no_grad():
+        tdt_out = m.transcribe([args.audio], batch_size=1, return_hypotheses=True)
+    tdt_hyps = tdt_out[0] if isinstance(tdt_out, tuple) else tdt_out
+    tdt_first = tdt_hyps[0]
+    y_seq = tdt_first.y_sequence
+    if isinstance(y_seq, torch.Tensor):
+        y_seq = y_seq.cpu().tolist()
+    tdt_token_ids = np.array(list(y_seq), dtype=np.int32)
+    tdt_text = tdt_first.text if hasattr(tdt_first, "text") else str(tdt_first)
+
     # Tokenizer detok fixture: a small hand-picked set of regular BPE ids
     # (avoid id=0 <unk> and blank_id=1024 which is beyond vocab).
     detok_ids = np.array([10, 25, 100, 3, 7], dtype=np.int32)
@@ -343,8 +376,15 @@ def main():
     w.add_tensor("detok_ids", detok_ids)
     w.add_tensor("pred_input_ids", np.ascontiguousarray(pred_input_ids))
     w.add_tensor("joint_enc_frames", np.ascontiguousarray(joint_enc_frames_arr))
+    # tdt_token_ids: NeMo's TDT greedy reference token ids. gguf cannot store a
+    # zero-length tensor, so only emit the tensor when non-empty; always record
+    # the length as a KV so consumers can distinguish "empty" from "missing".
+    w.add_uint32("baseline.tdt_token_count", int(tdt_token_ids.shape[0]))
+    if tdt_token_ids.shape[0] > 0:
+        w.add_tensor("tdt_token_ids", np.ascontiguousarray(tdt_token_ids))
     w.add_string("baseline.detok_text", detok_text)
     w.add_string("baseline.ctc_text", ctc_text)
+    w.add_string("baseline.tdt_text", tdt_text)
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
@@ -355,9 +395,13 @@ def main():
     shapes["detok_ids"] = tuple(detok_ids.shape)
     shapes["pred_input_ids"] = tuple(pred_input_ids.shape)
     shapes["joint_enc_frames"] = tuple(joint_enc_frames_arr.shape)
+    if tdt_token_ids.shape[0] > 0:
+        shapes["tdt_token_ids"] = tuple(tdt_token_ids.shape)
     print("baseline tensors:", shapes)
     print(f"baseline.detok_text: {repr(detok_text)}")
     print(f"baseline.ctc_text: {repr(ctc_text)}")
+    print(f"baseline.tdt_text: {repr(tdt_text)}")
+    print(f"tdt_token_ids ({tdt_token_ids.shape[0]}): {tdt_token_ids.tolist()}")
     print(
         f"transducer: pred_input_ids={pred_input_ids.tolist()} add_sos={add_sos} "
         f"U+1={shapes['pred_out'][0]} sos_embed_zero={sos_embed_is_zero} "

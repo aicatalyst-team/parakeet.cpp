@@ -37,6 +37,7 @@ set(PARAKEET_SRC
     src/ctc_decoder.cpp
     src/prediction.cpp
     src/joint.cpp
+    src/tdt.cpp
     src/tokenizer.cpp
     src/search.cpp)
 
