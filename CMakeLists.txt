@@ -24,7 +24,8 @@ add_subdirectory(third_party/ggml)
 set(PARAKEET_SRC
     src/parakeet.cpp
     src/common.cpp
-    src/audio_io.cpp)
+    src/audio_io.cpp
+    src/model_loader.cpp)
 
 if(PARAKEET_SHARED)
   add_library(parakeet SHARED ${PARAKEET_SRC})

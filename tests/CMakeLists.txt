@@ -8,6 +8,8 @@ endfunction()
 
 pk_add_test(test_smoke)
 pk_add_test(test_audio_io)
+pk_add_test(test_model_loader)
+set_tests_properties(test_model_loader PROPERTIES LABELS "model")
 
 # Python converter check (skips with exit 77 when the venv/model are absent).
 find_program(PARAKEET_PY NAMES python3 HINTS ${CMAKE_SOURCE_DIR}/.venv/bin)
