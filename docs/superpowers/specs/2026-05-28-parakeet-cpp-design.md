@@ -39,7 +39,15 @@ NeMo `AudioToMelSpectrogramPreprocessor` / `FilterbankFeatures`:
 | preemph | 0.97 |
 | mel norm | slaney |
 | normalize | per-feature mean/var (offline default) |
-| dither | training-only → skipped at inference |
+| dither | forced 0 at inference (parity) |
+
+**Validated against `nvidia/parakeet-ctc-0.6b`:** the restored config leaves
+`mag_power`, `preemph`, `mel_norm`, and the log-guard keys as `None`, so NeMo
+falls back to `FilterbankFeatures` defaults (mag_power 2.0, preemph 0.97,
+mel_norm slaney, log_zero_guard add 2⁻²⁴). The converter therefore reads the
+**effective** attributes off the instantiated `m.preprocessor.featurizer`, not
+the raw cfg, and the baseline dumper sets `featurizer.dither = 0.0` for a
+deterministic reference.
 
 ### FastConformer encoder
 - **Subsampling:** `dw_striding`, factor **8** (3× stride-2 stages), depthwise
@@ -50,11 +58,19 @@ NeMo `AudioToMelSpectrogramPreprocessor` / `FilterbankFeatures`:
 - **Self-attention:** `RelPositionMultiHeadAttention` (Transformer-XL style)
   with learned `pos_bias_u` / `pos_bias_v` and the relative-shift trick.
 - **Convolution module:** pointwise (d→2d) → GLU → depthwise convK
-  (kernel 9) → LayerNorm → SiLU → pointwise (d→d). Offline = **symmetric
-  (non-causal)** padding `(K-1)/2`.
-- **0.6B variant** dims are read from the checkpoint (≈ d_model 1024, ~24
-  layers, 8 heads, ff ×4, conv kernel 9). The loader is metadata-driven so exact
-  values come from GGUF KV, not hardcoded.
+  (kernel 9) → norm → SiLU → pointwise (d→d). Offline = **symmetric
+  (non-causal)** padding `(K-1)/2`. The norm is **batch_norm** in the published
+  `parakeet-*-0.6b` checkpoints (folded to an affine scale/shift from running
+  mean/var at inference); streaming configs use layer_norm. The loader is
+  variant-aware (`conv_norm_type` from KV) and the converter exports
+  `running_mean`/`running_var` for the batch_norm case.
+- **0.6B variant** dims, confirmed against `parakeet-ctc-0.6b`: d_model 1024,
+  n_layers 24, n_heads 8, ff_expansion_factor 4 (d_ff 4096), conv_kernel 9,
+  subsampling_conv_channels 256, xscaling true, att_context_size [-1,-1]. All
+  read from GGUF KV — the loader is metadata-driven, not hardcoded.
+- **Tensor layouts** (confirmed via forward hooks): conformer layers operate in
+  `[B, T, D]`; the encoder returns `[B, D, T]` (channels-first) to feed the
+  Conv1d-style decoders. B is always 1.
 
 ### Decoders
 - **CTC:** `ConvASRDecoder` — a single 1×1 Conv1d `d_model → vocab+1`
@@ -135,8 +151,10 @@ third_party/ggml        # pinned submodule
   acceptable, always B=1).
 - **relpos_attention:** numerically riskiest piece (the matrix rel-shift +
   pos_bias_u/v). Gets a dedicated parity test.
-- **conformer block:** SiLU = swish; GLU = split + sigmoid-mul; LayerNorm — all
-  native ggml.
+- **conformer block:** SiLU = swish; GLU = split + sigmoid-mul; LayerNorm for
+  the FFN/MHSA pre-norms; the conv module's norm is batch_norm (inference =
+  affine scale/shift) for published 0.6b, layer_norm for streaming — all native
+  ggml.
 - **rnnt prediction net:** ggml has no LSTM op → hand-rolled gates (1 layer,
   manageable).
 - **model_loader:** metadata-driven — all dims / durations / vocab from GGUF KV;
@@ -193,6 +211,10 @@ tensors. This is a hard prerequisite for Phase 1+, set up in Phase 0.
   to capture intermediate tensors.
 - Reference checkpoints are pulled from HuggingFace on first use and cached;
   baseline fixtures committed to the repo are small (single short clip).
+- **Validated 2026-05-28:** the env loads `parakeet-ctc-0.6b` on CPU, runs
+  `transcribe`, and forward hooks on `preprocessor` / `encoder.layers[i]` /
+  `encoder` capture intermediate tensors — confirming the baseline-dumper
+  mechanism works end-to-end.
 
 ## 9. Parity & testing strategy (A+C blended)
 
