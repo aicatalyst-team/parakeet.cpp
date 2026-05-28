@@ -130,3 +130,30 @@ n_heads 8, ff_dim 2048, conv_kernel 9, conv_norm_type `batch_norm`, subsampling 
 hop 160, preemph 0.97, mag_power 2.0, per-feature norm. Transducer: pred_hidden
 640 / 1 LSTM layer, joint_hidden 640 / relu. TDT durations `[0,1,2,3,4]`. Vocab
 1024, blank id 1024, SentencePiece pieces stored in KV.
+
+## Baseline intermediates — `baseline.gguf`
+
+`scripts/gen_nemo_baseline.py` dumps NeMo's intermediate tensors for the fixed
+fixture clip (`tests/fixtures/clip.wav`, 2 s 16 kHz mono) so each Phase 1 C++
+stage can be diffed against ground truth. Determinism is enforced by forcing
+`m.preprocessor.featurizer.dither = 0.0` and running under `torch.no_grad()` /
+`eval()`. The CTC logits come from an **explicit** forward
+(`m.preprocessor → m.encoder → m.ctc_decoder`), not `transcribe` — the hybrid's
+default transcribe uses the TDT head and never runs the CTC head.
+
+All tensors are squeezed (batch dim removed) and stored f32 except the int32
+ids. **Axis order matters** — note that the per-layer / subsampling captures are
+time-major `[T', d_model]` (NeMo's internal conformer orientation) whereas
+`encoder_out` is feature-major `[d_model, T']` (the encoder transposes on the way
+out). Shapes below are for the committed fixture on `parakeet-tdt_ctc-110m`.
+
+| Tensor | Source module | Axis order | Example shape |
+|---|---|---|---|
+| `mel` | `m.preprocessor` (element 0) | `[n_mels, T]` | `[80, 201]` |
+| `subsampling_out` | `m.encoder.pre_encode` (element 0) | `[T', d_model]` | `[26, 512]` |
+| `enc_layer_0` | `m.encoder.layers[0]` | `[T', d_model]` | `[26, 512]` |
+| `enc_layer_mid` | `m.encoder.layers[n//2]` | `[T', d_model]` | `[26, 512]` |
+| `enc_layer_last` | `m.encoder.layers[n-1]` | `[T', d_model]` | `[26, 512]` |
+| `encoder_out` | `m.encoder` (element 0, post-transpose) | `[d_model, T']` | `[512, 26]` |
+| `ctc_logits` | `m.ctc_decoder` (log-softmax) | `[T', V+1]` | `[26, 1025]` |
+| `ctc_argmax_ids` | argmax of `ctc_logits` over vocab axis | `[T']` int32 | `[26]` |
