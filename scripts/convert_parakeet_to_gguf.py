@@ -170,6 +170,57 @@ def main():
     w.add_uint32("parakeet.encoder.pos_emb_max_len",
                  int(_get(enc, "pos_emb_max_len", 5000)))
 
+    # --- Cache-aware streaming / causal config (Phase 5) ---------------------
+    # These KVs describe the chunked-limited attention + causal conv that the
+    # streaming FastConformer (e.g. parakeet_realtime_eou_120m-v1) uses. They are
+    # emitted ONLY for streaming models (att_context_style != "regular") so that
+    # offline checkpoints continue to convert byte-identically; the C++ loader
+    # supplies offline-safe defaults (style "regular", causal flags false,
+    # streaming block absent) when these keys are missing.
+    att_style = str(_get(enc, "att_context_style", "regular"))
+    is_streaming = att_style != "regular"
+    if is_streaming:
+        # att_context_size = [left, right]; streaming models use finite values
+        # (e.g. [70, 1]) while offline models use [-1, -1]. Stored as signed
+        # int32 so the -1 sentinel survives if a streaming model ever uses it;
+        # the loader reads them as int32 and defaults to -1 when absent.
+        att_ctx = _get(enc, "att_context_size", [-1, -1]) or [-1, -1]
+        att_ctx = [int(x) for x in att_ctx]
+        att_left = att_ctx[0] if len(att_ctx) > 0 else -1
+        att_right = att_ctx[1] if len(att_ctx) > 1 else -1
+        w.add_int32("parakeet.encoder.att_context_left", int(att_left))
+        w.add_int32("parakeet.encoder.att_context_right", int(att_right))
+        w.add_string("parakeet.encoder.att_context_style", att_style)
+        w.add_bool("parakeet.encoder.causal_downsampling",
+                   bool(_get(enc, "causal_downsampling", False)))
+        # conv_context_size == "causal" (a string) means the depthwise conv uses
+        # left-only padding; a list of two ints means symmetric/explicit padding.
+        conv_ctx = _get(enc, "conv_context_size", None)
+        conv_causal = isinstance(conv_ctx, str) and conv_ctx == "causal"
+        w.add_bool("parakeet.encoder.conv_causal", bool(conv_causal))
+
+        # Streaming params read straight off the live encoder's streaming_cfg
+        # (populated by setup_streaming_params() in __init__). List fields
+        # (chunk_size/shift_size/pre_encode_cache_size) are emitted as int32
+        # arrays; scalar fields as int32. Verified field names against
+        # CacheAwareStreamingConfig in models/configs/asr_models_config.py.
+        m.encoder.setup_streaming_params()
+        sc = m.encoder.streaming_cfg
+
+        def _int_list(v):
+            return [int(x) for x in (v if isinstance(v, (list, tuple)) else [v])]
+
+        w.add_array("parakeet.streaming.chunk_size", _int_list(sc.chunk_size))
+        w.add_array("parakeet.streaming.shift_size", _int_list(sc.shift_size))
+        w.add_int32("parakeet.streaming.cache_drop_size", int(sc.cache_drop_size))
+        w.add_int32("parakeet.streaming.last_channel_cache_size",
+                    int(sc.last_channel_cache_size))
+        w.add_int32("parakeet.streaming.valid_out_len", int(sc.valid_out_len))
+        w.add_array("parakeet.streaming.pre_encode_cache_size",
+                    _int_list(sc.pre_encode_cache_size))
+        w.add_int32("parakeet.streaming.drop_extra_pre_encoded",
+                    int(sc.drop_extra_pre_encoded))
+
     # preprocessor (effective values off the featurizer object)
     w.add_uint32("parakeet.preprocessor.sample_rate",
                  int(getattr(feat, "sample_rate", 16000)))

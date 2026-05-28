@@ -28,6 +28,29 @@ static int cmd_info(const char* path) {
         for (size_t i=0;i<c.tdt_durations.size();++i) std::printf("%s%d", i?",":"", c.tdt_durations[i]);
         std::printf("]\n");
     }
+    // Cache-aware streaming / causal config (Phase 5). Only meaningful for
+    // streaming models; offline models report style "regular" with full context.
+    std::printf("  att_context     : [%d,%d] %s\n",
+                c.att_context_left, c.att_context_right, c.att_context_style.c_str());
+    std::printf("  causal ds/conv  : %s / %s\n",
+                c.causal_downsampling ? "true" : "false",
+                c.conv_causal ? "true" : "false");
+    if (c.streaming.present) {
+        const pk::StreamingCfg& s = c.streaming;
+        auto print_ivec = [](const char* label, const std::vector<int32_t>& v) {
+            std::printf("  %-15s : [", label);
+            for (size_t i = 0; i < v.size(); ++i) std::printf("%s%d", i ? "," : "", v[i]);
+            std::printf("]\n");
+        };
+        std::printf("  streaming       : enabled\n");
+        print_ivec("  chunk_size", s.chunk_size);
+        print_ivec("  shift_size", s.shift_size);
+        print_ivec("  pre_enc_cache", s.pre_encode_cache_size);
+        std::printf("    cache_drop     : %d\n", s.cache_drop_size);
+        std::printf("    last_ch_cache  : %d\n", s.last_channel_cache_size);
+        std::printf("    valid_out_len  : %d\n", s.valid_out_len);
+        std::printf("    drop_extra_pre : %d\n", s.drop_extra_pre_encoded);
+    }
     return 0;
 }
 

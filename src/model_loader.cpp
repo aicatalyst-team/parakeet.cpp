@@ -7,6 +7,19 @@ namespace pk {
 static uint32_t kv_u32(gguf_context* g, const char* k, uint32_t d=0){
     int64_t id = gguf_find_key(g,k); return id<0 ? d : (uint32_t)gguf_get_val_u32(g,id);
 }
+static int32_t kv_i32(gguf_context* g, const char* k, int32_t d=0){
+    int64_t id = gguf_find_key(g,k); return id<0 ? d : gguf_get_val_i32(g,id);
+}
+static std::vector<int32_t> kv_i32_arr(gguf_context* g, const char* k){
+    std::vector<int32_t> out;
+    int64_t id = gguf_find_key(g,k);
+    if(id>=0 && gguf_get_arr_type(g,id)==GGUF_TYPE_INT32){
+        size_t n = gguf_get_arr_n(g,id);
+        const int32_t* a = (const int32_t*)gguf_get_arr_data(g,id);
+        out.assign(a, a+n);
+    }
+    return out;
+}
 static float kv_f32(gguf_context* g, const char* k, float d=0){
     int64_t id = gguf_find_key(g,k); return id<0 ? d : gguf_get_val_f32(g,id);
 }
@@ -33,6 +46,24 @@ bool ModelLoader::load(const std::string& path){
     cfg_.subsampling_conv_channels = kv_u32(gguf_, "parakeet.encoder.subsampling_conv_channels");
     cfg_.xscaling    = kv_bool(gguf_, "parakeet.encoder.xscaling", true);
     cfg_.pos_emb_max_len = kv_u32(gguf_, "parakeet.encoder.pos_emb_max_len", 5000);
+    // cache-aware streaming / causal config (Phase 5). Absent for offline models
+    // -> offline-safe defaults (regular style, no causal, streaming.present=false).
+    cfg_.att_context_left  = kv_i32(gguf_, "parakeet.encoder.att_context_left", -1);
+    cfg_.att_context_right = kv_i32(gguf_, "parakeet.encoder.att_context_right", -1);
+    cfg_.att_context_style = kv_str(gguf_, "parakeet.encoder.att_context_style", "regular");
+    cfg_.causal_downsampling = kv_bool(gguf_, "parakeet.encoder.causal_downsampling", false);
+    cfg_.conv_causal = kv_bool(gguf_, "parakeet.encoder.conv_causal", false);
+    if(cfg_.att_context_style != "regular"){
+        StreamingCfg& s = cfg_.streaming;
+        s.chunk_size = kv_i32_arr(gguf_, "parakeet.streaming.chunk_size");
+        s.shift_size = kv_i32_arr(gguf_, "parakeet.streaming.shift_size");
+        s.pre_encode_cache_size = kv_i32_arr(gguf_, "parakeet.streaming.pre_encode_cache_size");
+        s.cache_drop_size = kv_i32(gguf_, "parakeet.streaming.cache_drop_size", 0);
+        s.last_channel_cache_size = kv_i32(gguf_, "parakeet.streaming.last_channel_cache_size", 0);
+        s.valid_out_len = kv_i32(gguf_, "parakeet.streaming.valid_out_len", 0);
+        s.drop_extra_pre_encoded = kv_i32(gguf_, "parakeet.streaming.drop_extra_pre_encoded", 0);
+        s.present = true;
+    }
     cfg_.sample_rate = kv_u32(gguf_, "parakeet.preprocessor.sample_rate", 16000);
     cfg_.n_mels      = kv_u32(gguf_, "parakeet.preprocessor.n_mels");
     cfg_.n_fft       = kv_u32(gguf_, "parakeet.preprocessor.n_fft");

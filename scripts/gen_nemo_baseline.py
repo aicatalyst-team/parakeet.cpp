@@ -89,6 +89,21 @@ String KVs:
 * ``baseline.ctc_text``    authoritative NeMo CTC greedy transcript of the clip
 * ``baseline.tdt_text``    authoritative NeMo TDT-head greedy transcript of the clip
 
+Pure-RNNT / streaming-EOU baseline (Phase 5; ``EncDecRNNTBPEModel`` with no CTC
+head, e.g. ``nvidia/parakeet_realtime_eou_120m-v1``). When the model has no
+``ctc_decoder`` the script dumps a smaller, RNNT-only baseline (the model's
+normal offline forward already applies limited-context + causal + layer_norm):
+
+* ``mel``, ``subsampling_out``, ``l0_conv_out``, ``enc_layer_0``,
+  ``encoder_out`` — the same encoder-stage tensors as above (from the hooks).
+* ``rnnt_token_ids``  ``[L]`` int32   NeMo's RNNT greedy token-id sequence
+                                      (``hyp.y_sequence``), INCLUDING the
+                                      ``<EOU>``=1024 / ``<EOB>``=1025 special
+                                      tokens the transducer emits.
+* ``baseline.rnnt_token_count`` uint32  length of the above (so consumers can
+                                        tell "empty" from "missing").
+* ``baseline.rnnt_text``  str   the RNNT greedy transcript (raw, with ``<EOU>``).
+
 Exit codes (ctest convention): 0 = ok, 2 = deps/model unavailable, 1 = fail.
 """
 import argparse
@@ -257,17 +272,70 @@ def main():
     wav_t = torch.from_numpy(np.ascontiguousarray(wav)).float().unsqueeze(0)  # [1, S]
     len_t = torch.tensor([wav_t.shape[1]], dtype=torch.int64)
 
-    # Explicit forward path (NOT transcribe) so the CTC head actually runs.
+    # A pure RNNT model (e.g. the streaming nvidia/parakeet_realtime_eou_120m-v1,
+    # an EncDecRNNTBPEModel) has no CTC head and no hybrid decoder-strategy switch.
+    # For those we dump the shared encoder-stage tensors plus the RNNT greedy
+    # token ids (incl. <EOU>/<EOB>); the CTC/TDT-specific captures below are
+    # skipped. Existing hybrid (CTC + TDT) behaviour is left intact.
+    has_ctc = getattr(m, "ctc_decoder", None) is not None
+    is_pure_rnnt = (not has_ctc) and getattr(m, "joint", None) is not None
+
+    # Explicit forward path (NOT transcribe) so the CTC head actually runs (for
+    # hybrid models). The streaming/causal/layer_norm offline forward of the EOU
+    # model is exactly this same encoder forward.
     #   preprocessor.forward(input_signal, length) -> (feats[B,n_mels,T], feat_len)
     #   encoder.forward(audio_signal, length)      -> (enc[B,d_model,T'], enc_len)
     #   ctc_decoder.forward(encoder_output)        -> log-probs [B, T', V+1]
     with torch.no_grad():
         feats, feat_len = m.preprocessor(input_signal=wav_t, length=len_t)
         enc, enc_len = m.encoder(audio_signal=feats, length=feat_len)
-        ctc_log = m.ctc_decoder(encoder_output=enc)
+        ctc_log = m.ctc_decoder(encoder_output=enc) if has_ctc else None
 
     for h in handles:
         h.remove()
+
+    # ---- Pure-RNNT (streaming EOU) baseline: encoder stages + RNNT greedy ----
+    if is_pure_rnnt:
+        # m.transcribe runs the model's normal offline forward (limited-context
+        # + causal + layer_norm) and the RNNT greedy decoder. hyp.y_sequence is
+        # the exact token-id sequence (incl. <EOU>=1024 / <EOB>=1025) the C++
+        # rnnt_greedy loop must reproduce.
+        with torch.no_grad():
+            rnnt_out = m.transcribe([args.audio], batch_size=1, return_hypotheses=True)
+        rnnt_hyps = rnnt_out[0] if isinstance(rnnt_out, tuple) else rnnt_out
+        rnnt_first = rnnt_hyps[0]
+        ys = rnnt_first.y_sequence
+        if isinstance(ys, torch.Tensor):
+            ys = ys.cpu().tolist()
+        rnnt_token_ids = np.array(list(ys), dtype=np.int32)
+        rnnt_text = rnnt_first.text if hasattr(rnnt_first, "text") else str(rnnt_first)
+
+        # Required encoder-stage tensors for the offline-parity tests (Tasks 2-3):
+        # mel, subsampling_out, l0_conv_out, enc_layer_0, encoder_out are already
+        # captured by the hooks above. Write only those + the RNNT ground truth.
+        keep = {"mel", "subsampling_out", "l0_conv_out", "enc_layer_0", "encoder_out"}
+        w = gguf.GGUFWriter(args.output, "parakeet-baseline")
+        shapes = {}
+        for k in sorted(cap):
+            if k in keep:
+                arr = _squeeze(cap[k])
+                w.add_tensor(k, arr)
+                shapes[k] = tuple(arr.shape)
+        w.add_uint32("baseline.rnnt_token_count", int(rnnt_token_ids.shape[0]))
+        if rnnt_token_ids.shape[0] > 0:
+            w.add_tensor("rnnt_token_ids", np.ascontiguousarray(rnnt_token_ids))
+            shapes["rnnt_token_ids"] = tuple(rnnt_token_ids.shape)
+        w.add_string("baseline.rnnt_text", rnnt_text)
+        w.write_header_to_file()
+        w.write_kv_data_to_file()
+        w.write_tensors_to_file()
+        w.close()
+        print("baseline tensors:", shapes)
+        print(f"baseline.rnnt_text: {repr(rnnt_text)}")
+        print(f"rnnt_token_ids ({rnnt_token_ids.shape[0]}): {rnnt_token_ids.tolist()}")
+        print(f"wrote {args.output}: tensors={len(shapes)} "
+              f"(pure RNNT / streaming EOU, dither=0.0, explicit forward)")
+        return
 
     cap["ctc_logits"] = ctc_log.detach().cpu().float().numpy()  # [B, T', V+1]
 

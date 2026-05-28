@@ -7,6 +7,19 @@ struct ggml_tensor;
 struct ggml_context;
 struct gguf_context;
 namespace pk {
+// Cache-aware streaming params (Phase 5), populated only for streaming models
+// (att_context_style != "regular"). Mirrors NeMo CacheAwareStreamingConfig.
+// List fields are stored as int32 arrays in the GGUF (e.g. chunk_size=[9,16]).
+struct StreamingCfg {
+    std::vector<int32_t> chunk_size;              // per-step encoder chunk frames
+    std::vector<int32_t> shift_size;              // per-step shift frames
+    std::vector<int32_t> pre_encode_cache_size;   // pre-encode cache (mel frames)
+    int32_t cache_drop_size=0;
+    int32_t last_channel_cache_size=0;            // attention left-context cache
+    int32_t valid_out_len=0;                      // valid encoder frames per step
+    int32_t drop_extra_pre_encoded=0;
+    bool present=false;                           // true only for streaming models
+};
 struct ParakeetConfig {
     std::string arch;
     // encoder
@@ -14,6 +27,12 @@ struct ParakeetConfig {
     std::string conv_norm_type;
     uint32_t subsampling_factor=0, subsampling_conv_channels=0, pos_emb_max_len=5000;
     bool xscaling=true;
+    // cache-aware streaming / causal config (Phase 5; offline-safe defaults)
+    int32_t att_context_left=-1, att_context_right=-1; // [-1,-1] = full context
+    std::string att_context_style="regular";            // or "chunked_limited"
+    bool causal_downsampling=false;                     // causal subsampling pad
+    bool conv_causal=false;                             // causal depthwise conv pad
+    StreamingCfg streaming;
     // preprocessor
     uint32_t sample_rate=16000, n_mels=0, n_fft=0, win_length=0, hop_length=0;
     float preemph=0.0f, mag_power=2.0f, log_zero_guard=0.0f;

@@ -27,7 +27,13 @@ checkpoint are unavailable).
 
 All keys below are emitted for the hybrid anchor `parakeet-tdt_ctc-110m`. CTC-only
 checkpoints omit the `parakeet.decoder.*` / `parakeet.joint.*` / `parakeet.tdt.*`
-keys; non-TDT transducers omit `parakeet.tdt.durations`.
+keys; non-TDT transducers omit `parakeet.tdt.durations`. The
+`parakeet.encoder.att_context_*` / `causal_*` / `conv_causal` and
+`parakeet.streaming.*` keys are emitted **only for cache-aware streaming models**
+(`att_context_style != "regular"`, e.g. `nvidia/parakeet_realtime_eou_120m-v1`);
+offline checkpoints omit them entirely (so they keep converting byte-identically)
+and the C++ loader falls back to offline-safe defaults (`att_context [-1,-1]`,
+style `regular`, causal flags `false`, no streaming block).
 
 | Key | GGUF type | Meaning | Source | 110m value |
 | --- | --- | --- | --- | --- |
@@ -43,6 +49,18 @@ keys; non-TDT transducers omit `parakeet.tdt.durations`.
 | `parakeet.encoder.subsampling_conv_channels` | UINT32 | Subsampling conv channels | `cfg.encoder.subsampling_conv_channels` | 256 |
 | `parakeet.encoder.xscaling` | BOOL | Scale embeddings by √d_model | `cfg.encoder.xscaling` | `false` |
 | `parakeet.encoder.pos_emb_max_len` | UINT32 | Max relative-pos length | `cfg.encoder.pos_emb_max_len` | 5000 |
+| `parakeet.encoder.att_context_left` | INT32 | Attention left context (`att_context_size[0]`); `-1` = unbounded. **Streaming only.** | `cfg.encoder.att_context_size` | (n/a) |
+| `parakeet.encoder.att_context_right` | INT32 | Attention right context (`att_context_size[1]`); `-1` = unbounded. **Streaming only.** | `cfg.encoder.att_context_size` | (n/a) |
+| `parakeet.encoder.att_context_style` | STRING | `regular` or `chunked_limited`. **Streaming only** (offline loader defaults `regular`). | `cfg.encoder.att_context_style` | (n/a) |
+| `parakeet.encoder.causal_downsampling` | BOOL | Causal (left-pad) subsampling. **Streaming only** (default `false`). | `cfg.encoder.causal_downsampling` | (n/a) |
+| `parakeet.encoder.conv_causal` | BOOL | Causal depthwise conv (`conv_context_size=="causal"`). **Streaming only** (default `false`). | `cfg.encoder.conv_context_size` | (n/a) |
+| `parakeet.streaming.chunk_size` | ARRAY\<INT32\> | Per-step encoder chunk frames `[first, rest]`. **Streaming only.** | `encoder.streaming_cfg.chunk_size` | (n/a) |
+| `parakeet.streaming.shift_size` | ARRAY\<INT32\> | Per-step shift frames `[first, rest]`. **Streaming only.** | `encoder.streaming_cfg.shift_size` | (n/a) |
+| `parakeet.streaming.cache_drop_size` | INT32 | Steps dropped from the cache. **Streaming only.** | `encoder.streaming_cfg.cache_drop_size` | (n/a) |
+| `parakeet.streaming.last_channel_cache_size` | INT32 | Attention left-context cache size. **Streaming only.** | `encoder.streaming_cfg.last_channel_cache_size` | (n/a) |
+| `parakeet.streaming.valid_out_len` | INT32 | Valid encoder frames per step. **Streaming only.** | `encoder.streaming_cfg.valid_out_len` | (n/a) |
+| `parakeet.streaming.pre_encode_cache_size` | ARRAY\<INT32\> | Pre-encode (mel) cache frames `[first, rest]`. **Streaming only.** | `encoder.streaming_cfg.pre_encode_cache_size` | (n/a) |
+| `parakeet.streaming.drop_extra_pre_encoded` | INT32 | Steps dropped after pre-encode. **Streaming only.** | `encoder.streaming_cfg.drop_extra_pre_encoded` | (n/a) |
 | `parakeet.preprocessor.sample_rate` | UINT32 | Audio sample rate | `featurizer.sample_rate` | 16000 |
 | `parakeet.preprocessor.n_mels` | UINT32 | Mel filterbank count | `featurizer.nfilt` | 80 |
 | `parakeet.preprocessor.n_fft` | UINT32 | FFT size | `featurizer.n_fft` | 512 |
