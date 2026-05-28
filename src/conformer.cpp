@@ -25,6 +25,17 @@ static ggml_tensor* clone_weight(ggml_context* ctx, const ModelLoader& ml,
     return dst;
 }
 
+// Like clone_weight but returns nullptr when the tensor is absent (optional
+// weight). The conformer conv submodule's Conv1d biases are present in some
+// checkpoints (e.g. parakeet-tdt_ctc-110m) and absent in others where NeMo
+// configures the convolutions with bias=False (e.g. parakeet-tdt-0.6b-v2/-v3).
+// Honour whatever the checkpoint actually carries instead of assuming a bias.
+static ggml_tensor* clone_weight_opt(ggml_context* ctx, const ModelLoader& ml,
+                                     const std::string& name) {
+    if (!ml.tensor(name)) return nullptr;
+    return clone_weight(ctx, ml, name);
+}
+
 ConformerLayer::ConformerLayer(const ModelLoader& ml, int layer_idx)
     : ml_(ml), layer_idx_(layer_idx) {
     d_model_     = (int)ml.config().d_model;
@@ -83,13 +94,16 @@ void ConformerLayer::forward_with_conv(const std::vector<float>& x, int T,
         return y;
     };
     // nn.Linear: ggml weight ne = [in, out]. in ne [in, T] -> [out, T].
+    // The bias is added only when both requested AND present in the checkpoint:
+    // NeMo configures the FastConformer FFN/attention linears with bias=False in
+    // some models (parakeet-tdt-0.6b-v2/-v3) and bias=True in others (110m).
     auto linear = [&](ggml_context* ctx, ggml_tensor* in,
                       const std::string& nm, bool bias) {
         ggml_tensor* W = clone_weight(ctx, ml, pre + nm + ".weight");
         ggml_tensor* y = ggml_mul_mat(ctx, W, in);
         if (bias) {
-            ggml_tensor* B = clone_weight(ctx, ml, pre + nm + ".bias");
-            y = ggml_add(ctx, y, B);
+            ggml_tensor* B = clone_weight_opt(ctx, ml, pre + nm + ".bias");
+            if (B) y = ggml_add(ctx, y, B);
         }
         return y;
     };
@@ -157,9 +171,9 @@ void ConformerLayer::forward_with_conv(const std::vector<float>& x, int T,
                 //    KW=1 to get a [d, 2d] mul_mat weight.
                 ggml_tensor* pw1w = clone_weight(ctx, ml, pre + "conv.pointwise_conv1.weight");
                 pw1w = ggml_reshape_2d(ctx, pw1w, D, 2 * D); // [in=d, out=2d]
-                ggml_tensor* pw1b = clone_weight(ctx, ml, pre + "conv.pointwise_conv1.bias");
+                ggml_tensor* pw1b = clone_weight_opt(ctx, ml, pre + "conv.pointwise_conv1.bias");
                 ggml_tensor* y = ggml_mul_mat(ctx, pw1w, c); // [2d, T]
-                y = ggml_add(ctx, y, pw1b);
+                if (pw1b) y = ggml_add(ctx, y, pw1b);
 
                 // -- GLU over channel dim (NeMo F.glu(x, dim=1)): first half *
                 //    sigmoid(second half). y ne0 spans 2d channels [0:d]|[d:2d].
@@ -202,9 +216,9 @@ void ConformerLayer::forward_with_conv(const std::vector<float>& x, int T,
                 // dw ne = [OW=T, C, 1]; bias [C] added per channel, then back to
                 // [C, T] (channels fastest) for batch_norm / activation / pw2.
                 dw = ggml_reshape_2d(ctx, dw, T, D);                  // [T, C]
-                ggml_tensor* dwb = clone_weight(ctx, ml, pre + "conv.depthwise_conv.bias"); // [C]
+                ggml_tensor* dwb = clone_weight_opt(ctx, ml, pre + "conv.depthwise_conv.bias"); // [C]
                 ggml_tensor* dwt = ggml_cont(ctx, ggml_transpose(ctx, dw)); // [C, T]
-                dwt = ggml_add(ctx, dwt, dwb);                        // broadcast [C] over T
+                if (dwb) dwt = ggml_add(ctx, dwt, dwb);               // broadcast [C] over T
 
                 // -- batch_norm (inference): y = (x-mean)/sqrt(var+eps)*g + b,
                 //    per-channel. Fold into constant scale/shift [C] in C++
@@ -230,9 +244,9 @@ void ConformerLayer::forward_with_conv(const std::vector<float>& x, int T,
                 bn = ggml_silu(ctx, bn);
                 ggml_tensor* pw2w = clone_weight(ctx, ml, pre + "conv.pointwise_conv2.weight");
                 pw2w = ggml_reshape_2d(ctx, pw2w, D, D); // [in=d, out=d]
-                ggml_tensor* pw2b = clone_weight(ctx, ml, pre + "conv.pointwise_conv2.bias");
+                ggml_tensor* pw2b = clone_weight_opt(ctx, ml, pre + "conv.pointwise_conv2.bias");
                 ggml_tensor* cout = ggml_mul_mat(ctx, pw2w, bn); // [d, T]
-                cout = ggml_add(ctx, cout, pw2b);
+                if (pw2b) cout = ggml_add(ctx, cout, pw2b);
                 return cout; // [D, T] -> row-major [T, D]; this is layers[i].conv output
             }, conv_out);
         assert(ok && "conformer conv graph failed"); (void)ok;

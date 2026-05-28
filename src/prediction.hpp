@@ -6,16 +6,23 @@
 namespace pk {
 
 // Carries the LSTM hidden and cell state for stateful single-step decoding.
+// One (h, c) pair PER stacked LSTM layer (PyTorch nn.LSTM with num_layers>1).
+// h[l] / c[l] are each [hidden]. For a single-layer LSTM the outer vectors hold
+// exactly one element.
 struct PredState {
-    std::vector<float> h; // [hidden]
-    std::vector<float> c; // [hidden]
+    std::vector<std::vector<float>> h; // h[layer] = [hidden]
+    std::vector<std::vector<float>> c; // c[layer] = [hidden]
 };
 
 // RNN-Transducer prediction network — NeMo RNNTDecoder prediction net.
 //
 // Architecture:
 //   Embedding(vocab+1, pred_hidden, padding_idx=blank) lookup
-//   Single-layer LSTM (PyTorch convention)
+//   Stacked LSTM with `pred_rnn_layers` layers (PyTorch convention). The 110m
+//   anchor has 1 layer; parakeet-tdt-0.6b-v2/-v3 have 2. The number of layers
+//   is read from the GGUF (parakeet.decoder.pred_rnn_layers); each layer l uses
+//   the weight_ih_l{l}/weight_hh_l{l}/bias_*_l{l} tensors, and layer l>0 takes
+//   the previous layer's hidden output h as its input.
 //
 // LSTM math (per step, input x_t [H], prev h,c [H]; h0=c0=0):
 //   z = W_ih · x_t + b_ih + W_hh · h + b_hh        # [4H]
@@ -28,12 +35,12 @@ struct PredState {
 // embedded sequence (matching NeMo predict(add_sos=True)), so the output has
 // U+1 hidden states. The output is the sequence of h' states.
 //
-// Tensors (verbatim NeMo names):
-//   decoder.prediction.embed.weight              ggml ne=[H, vocab+1]
-//   decoder.prediction.dec_rnn.lstm.weight_ih_l0 ggml ne=[H, 4H]
-//   decoder.prediction.dec_rnn.lstm.weight_hh_l0 ggml ne=[H, 4H]
-//   decoder.prediction.dec_rnn.lstm.bias_ih_l0   ggml ne=[4H]
-//   decoder.prediction.dec_rnn.lstm.bias_hh_l0   ggml ne=[4H]
+// Tensors (verbatim NeMo names; l = LSTM layer index 0..pred_rnn_layers-1):
+//   decoder.prediction.embed.weight               ggml ne=[H, vocab+1]
+//   decoder.prediction.dec_rnn.lstm.weight_ih_l{l} ggml ne=[H, 4H]
+//   decoder.prediction.dec_rnn.lstm.weight_hh_l{l} ggml ne=[H, 4H]
+//   decoder.prediction.dec_rnn.lstm.bias_ih_l{l}   ggml ne=[4H]
+//   decoder.prediction.dec_rnn.lstm.bias_hh_l{l}   ggml ne=[4H]
 class PredictionNet {
 public:
     explicit PredictionNet(const ModelLoader& ml);
@@ -62,15 +69,19 @@ public:
 
     int hidden_size() const { return H_; }
 
+    int num_layers() const { return n_layers_; }
+
 private:
     const ModelLoader& ml_;
     int H_;       // pred_hidden
     int vocab_p1_; // vocab + 1 (embedding rows)
+    int n_layers_; // pred_rnn_layers (stacked LSTM layers)
 
-    // Single LSTM cell step shared by forward() and step().
-    // x[H]: input embedding; h_in[H], c_in[H]: previous state.
-    // h_out[H], c_out[H]: new state (written in-place).
-    void lstm_cell(const float* x,
+    // Single LSTM cell step for stacked-LSTM layer `layer`, shared by forward()
+    // and step(). x[H]: this layer's input (embedding for layer 0, the previous
+    // layer's h' for layer>0); h_in[H], c_in[H]: this layer's previous state.
+    // h_out[H], c_out[H]: this layer's new state (written in-place).
+    void lstm_cell(int layer, const float* x,
                    const float* h_in, const float* c_in,
                    float* h_out, float* c_out) const;
 };

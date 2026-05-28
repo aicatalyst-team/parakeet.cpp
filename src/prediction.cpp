@@ -22,6 +22,8 @@ const float* tensor_data(const ModelLoader& ml, const char* name) {
 PredictionNet::PredictionNet(const ModelLoader& ml) : ml_(ml) {
     H_        = (int)ml.config().pred_hidden;
     vocab_p1_ = (int)ml.config().vocab_size + 1;
+    n_layers_ = (int)ml.config().pred_rnn_layers;
+    if (n_layers_ <= 0) n_layers_ = 1; // default to a single LSTM layer
     assert(H_ > 0 && "pred_hidden not set");
 }
 
@@ -31,16 +33,17 @@ PredictionNet::PredictionNet(const ModelLoader& ml) : ml_(ml) {
 // h_in[H], c_in[H]: state coming in.
 // h_out[H], c_out[H]: state written out.
 // ---------------------------------------------------------------------------
-void PredictionNet::lstm_cell(const float* x,
+void PredictionNet::lstm_cell(int layer, const float* x,
                                const float* h_in, const float* c_in,
                                float* h_out, float* c_out) const {
     const int H  = H_;
     const int H4 = 4 * H;
 
-    const float* W_ih = tensor_data(ml_, "decoder.prediction.dec_rnn.lstm.weight_ih_l0");
-    const float* W_hh = tensor_data(ml_, "decoder.prediction.dec_rnn.lstm.weight_hh_l0");
-    const float* b_ih = tensor_data(ml_, "decoder.prediction.dec_rnn.lstm.bias_ih_l0");
-    const float* b_hh = tensor_data(ml_, "decoder.prediction.dec_rnn.lstm.bias_hh_l0");
+    const std::string sfx = "_l" + std::to_string(layer);
+    const float* W_ih = tensor_data(ml_, ("decoder.prediction.dec_rnn.lstm.weight_ih" + sfx).c_str());
+    const float* W_hh = tensor_data(ml_, ("decoder.prediction.dec_rnn.lstm.weight_hh" + sfx).c_str());
+    const float* b_ih = tensor_data(ml_, ("decoder.prediction.dec_rnn.lstm.bias_ih" + sfx).c_str());
+    const float* b_hh = tensor_data(ml_, ("decoder.prediction.dec_rnn.lstm.bias_hh" + sfx).c_str());
 
     // z[out] = b_ih[out] + b_hh[out]
     //        + sum_in W_ih[out, in] * x[in]
@@ -100,17 +103,26 @@ void PredictionNet::forward(const std::vector<int32_t>& ids, bool add_sos,
                     (size_t)H * sizeof(float));
     }
 
-    // LSTM recurrence using the shared lstm_cell helper.
+    // Stacked-LSTM recurrence using the shared lstm_cell helper. Per-layer state
+    // (h, c) is carried across timesteps; within a timestep layer l>0 consumes
+    // the previous layer's hidden output. The sequence output is the TOP layer's
+    // h' at each step (matching PyTorch nn.LSTM output semantics).
+    const int L = n_layers_;
     out.assign((size_t)seq * H, 0.0f);
-    std::vector<float> h(H, 0.0f), c(H, 0.0f);
+    std::vector<std::vector<float>> h(L, std::vector<float>(H, 0.0f));
+    std::vector<std::vector<float>> c(L, std::vector<float>(H, 0.0f));
     std::vector<float> h_new(H), c_new(H);
 
     for (int t = 0; t < seq; ++t) {
-        const float* x = &X[(size_t)t * H];
-        lstm_cell(x, h.data(), c.data(), h_new.data(), c_new.data());
-        std::memcpy(&out[(size_t)t * H], h_new.data(), (size_t)H * sizeof(float));
-        h.swap(h_new);
-        c.swap(c_new);
+        const float* layer_in = &X[(size_t)t * H];
+        for (int l = 0; l < L; ++l) {
+            lstm_cell(l, layer_in, h[l].data(), c[l].data(),
+                      h_new.data(), c_new.data());
+            h[l].swap(h_new);
+            c[l].swap(c_new);
+            layer_in = h[l].data(); // next layer consumes this layer's output
+        }
+        std::memcpy(&out[(size_t)t * H], h[L - 1].data(), (size_t)H * sizeof(float));
     }
 }
 
@@ -119,8 +131,8 @@ void PredictionNet::forward(const std::vector<int32_t>& ids, bool add_sos,
 // ---------------------------------------------------------------------------
 PredState PredictionNet::zero_state() const {
     PredState s;
-    s.h.assign((size_t)H_, 0.0f);
-    s.c.assign((size_t)H_, 0.0f);
+    s.h.assign((size_t)n_layers_, std::vector<float>((size_t)H_, 0.0f));
+    s.c.assign((size_t)n_layers_, std::vector<float>((size_t)H_, 0.0f));
     return s;
 }
 
@@ -129,8 +141,9 @@ void PredictionNet::step(int32_t token_id, bool is_sos,
                           std::vector<float>& g,
                           PredState& out_state) const {
     const int H = H_;
+    const int L = n_layers_;
 
-    // Build the input embedding for this one step.
+    // Build the input embedding for this one step (layer 0's input).
     std::vector<float> x(H, 0.0f); // zero → SOS by default
     if (!is_sos) {
         assert(token_id >= 0 && token_id < vocab_p1_ && "embedding id out of range");
@@ -138,14 +151,18 @@ void PredictionNet::step(int32_t token_id, bool is_sos,
         std::memcpy(x.data(), &embed[(size_t)token_id * H], (size_t)H * sizeof(float));
     }
 
-    // Run one LSTM cell step.
+    // Run one step through the stacked LSTM, layer l>0 consuming layer l-1's h'.
+    out_state.h.assign((size_t)L, std::vector<float>((size_t)H));
+    out_state.c.assign((size_t)L, std::vector<float>((size_t)H));
+    const float* layer_in = x.data();
+    for (int l = 0; l < L; ++l) {
+        lstm_cell(l, layer_in, in.h[l].data(), in.c[l].data(),
+                  out_state.h[l].data(), out_state.c[l].data());
+        layer_in = out_state.h[l].data(); // feed this layer's output to the next
+    }
+    // g = top layer's h'
     g.resize(H);
-    out_state.h.resize(H);
-    out_state.c.resize(H);
-    lstm_cell(x.data(), in.h.data(), in.c.data(),
-              out_state.h.data(), out_state.c.data());
-    // g = h'
-    std::memcpy(g.data(), out_state.h.data(), (size_t)H * sizeof(float));
+    std::memcpy(g.data(), out_state.h[L - 1].data(), (size_t)H * sizeof(float));
 }
 
 } // namespace pk

@@ -64,10 +64,13 @@ void RelPosAttention::forward(const std::vector<float>& x, int T,
             std::memcpy(pe->data, pos_emb.data(), (size_t)pos_len * D * sizeof(float));
 
             // ---- linear projections (nn.Linear: ggml W ne=[in,out]) ----
+            // The bias is added only when requested AND present: NeMo configures
+            // the attention linears with bias=False in some checkpoints
+            // (parakeet-tdt-0.6b-v2/-v3) and bias=True in others (110m).
             auto linear = [&](const char* w, const char* b, ggml_tensor* in) {
                 ggml_tensor* W = clone_weight(ctx, ml, pre + w);
                 ggml_tensor* y = ggml_mul_mat(ctx, W, in);  // [out, *]
-                if (b) {
+                if (b && ml.tensor(pre + b)) {
                     ggml_tensor* B = clone_weight(ctx, ml, pre + b);
                     y = ggml_add(ctx, y, B);                // broadcast [out] over cols
                 }
