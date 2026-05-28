@@ -1,0 +1,7 @@
+/build*/
+/.venv/
+/models/
+*.gguf
+__pycache__/
+*.pyc
+/.cache/
