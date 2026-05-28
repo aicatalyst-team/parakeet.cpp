@@ -51,6 +51,10 @@ names = {t.name for t in reader.tensors}
 required = [
     "mel",
     "subsampling_out",
+    "pos_emb",
+    "enc_pre_layers",
+    "l0_attn_out",
+    "l0_conv_out",
     "enc_layer_0",
     "enc_layer_mid",
     "enc_layer_last",

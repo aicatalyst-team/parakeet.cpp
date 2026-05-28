@@ -19,6 +19,10 @@ Stored tensors (squeezed; f32 except the int32 ids). Axis order documented in
 
 * ``mel``             ``[n_mels, T]``      output of ``m.preprocessor``
 * ``subsampling_out`` ``[T', d_model]``    output of ``m.encoder.pre_encode``
+* ``pos_emb``         ``[2*T'-1, d_model]`` rel pos enc (``m.encoder.pos_enc`` out[1])
+* ``enc_pre_layers``  ``[T', d_model]``    tensor fed INTO conformer ``layers[0]``
+* ``l0_attn_out``     ``[T', d_model]``    output of ``layers[0].self_attn`` (RelPosMHA)
+* ``l0_conv_out``     ``[T', d_model]``    output of ``layers[0].conv`` (ConformerConvolution)
 * ``enc_layer_0``     ``[T', d_model]``    output of conformer ``layers[0]``
 * ``enc_layer_mid``   ``[T', d_model]``    output of conformer ``layers[n//2]``
 * ``enc_layer_last``  ``[T', d_model]``    output of conformer ``layers[n-1]``
@@ -95,10 +99,68 @@ def main():
                 cap[name] = t.detach().cpu().float().numpy()
         return fn
 
+    def save_pos_emb(name):
+        # RelPositionalEncoding.forward returns (dropout(x), pos_emb); we want the
+        # SECOND element (the [1, 2*T'-1, d_model] relative positional encoding),
+        # NOT element 0 (the scaled input embeddings).
+        def fn(mod, inp, out):
+            if not isinstance(out, (tuple, list)) or len(out) < 2:
+                raise RuntimeError(
+                    f"baseline: expected pos_enc to return a (x, pos_emb) tuple, "
+                    f"got {type(out).__name__} (len={len(out) if hasattr(out, '__len__') else 'n/a'})"
+                )
+            t = out[1]
+            if not isinstance(t, torch.Tensor):
+                raise RuntimeError(
+                    f"baseline: pos_enc out[1] is not a tensor (got {type(t).__name__})"
+                )
+            cap[name] = t.detach().cpu().float().numpy()
+        return fn
+
+    def save_layer_input(name):
+        # Forward PRE-hook on layers[0]: capture the tensor fed INTO the layer
+        # (encoder embeddings after subsampling + xscaling + dropout). The encoder
+        # calls the layer with x as a KEYWORD arg, so prefer kwargs['x'] and fall
+        # back to the first positional arg.
+        def fn(mod, args, kwargs):
+            t = kwargs.get("x") if "x" in kwargs else (args[0] if args else None)
+            if not isinstance(t, torch.Tensor):
+                raise RuntimeError(
+                    f"baseline: could not capture {name}: layer input was not a "
+                    f"tensor (args={len(args)}, kwargs={sorted(kwargs)})"
+                )
+            cap[name] = t.detach().cpu().float().numpy()
+        return fn
+
+    def submodule(path):
+        """Resolve a dotted attribute path under ``m``; clear error if missing."""
+        obj = m
+        for attr in path.split("."):
+            if attr.endswith("]") and "[" in attr:
+                base, idx = attr[:-1].split("[")
+                obj = getattr(obj, base)[int(idx)]
+            else:
+                obj = getattr(obj, attr, None)
+            if obj is None:
+                raise RuntimeError(
+                    f"baseline: submodule '{path}' not found on the model "
+                    f"(failed at '{attr}'). The NeMo module layout may differ."
+                )
+        return obj
+
     n = len(m.encoder.layers)
     handles = [
         m.preprocessor.register_forward_hook(save("mel")),
         m.encoder.pre_encode.register_forward_hook(save("subsampling_out")),
+        # Fine-grained encoder captures for relpos-attention / conformer parity.
+        submodule("encoder.pos_enc").register_forward_hook(save_pos_emb("pos_emb")),
+        submodule("encoder.layers[0]").register_forward_pre_hook(
+            save_layer_input("enc_pre_layers"), with_kwargs=True
+        ),
+        submodule("encoder.layers[0].self_attn").register_forward_hook(
+            save("l0_attn_out")
+        ),
+        submodule("encoder.layers[0].conv").register_forward_hook(save("l0_conv_out")),
         m.encoder.layers[0].register_forward_hook(save("enc_layer_0")),
         m.encoder.layers[n // 2].register_forward_hook(save("enc_layer_mid")),
         m.encoder.layers[n - 1].register_forward_hook(save("enc_layer_last")),
