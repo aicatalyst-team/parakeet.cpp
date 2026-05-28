@@ -27,9 +27,36 @@ A weight is quantized only if it is on the allowlist below **and** it is at leas
 `ne[0]`) is divisible by the 32-element block size. Otherwise it stays F32. See
 `should_quantize()` in the converter.
 
-The CLI K-quant path (`parakeet-cli quantize`, Phase 4 Task 3) re-quantizes the
-**same** allowlist to `Q4_K`/`Q5_K`/`Q6_K`; this document covers the converter's
-`f16`/`q8_0` path only.
+## CLI K-quants (`parakeet-cli quantize`)
+
+The Python `gguf` writer can emit `f16`/`q8_0`/`q4_0`/`q5_0` but **not** the
+K-quants (`Q4_K`/`Q5_K`/`Q6_K`). For those, re-quantize an existing F32 GGUF
+with the CLI:
+
+```bash
+parakeet-cli quantize <in.gguf> <out.gguf> <q4_0|q5_0|q8_0|q4_k|q5_k|q6_k>
+# e.g.
+parakeet-cli quantize model_f32.gguf model_q4k.gguf q4_k
+parakeet-cli quantize model_f32.gguf model_q6k.gguf q6_k
+```
+
+The type string is case-insensitive. The CLI reads the source GGUF (gguf C API
++ ggml context, same as `ModelLoader`), re-quantizes **exactly the same
+allowlist** (the linear `mul_mat` `src0` weights below) via
+`ggml_quantize_chunk(type, src, dst, 0, nrows, n_per_row, /*imatrix*/ NULL)`
+(none of these types require an importance matrix), copies every other tensor
+verbatim in its stored type, and copies **all** KV metadata unchanged
+(`gguf_init_empty` + `gguf_set_kv` + `gguf_add_tensor` + `gguf_write_to_file`).
+
+A tensor is quantized only if it is on the allowlist, F32, 2-D with both dims
+≥ 32, **and** its leading ggml dim (`ne[0]`, the contraction axis) is divisible
+by the target type's block size. The `q*_0` blocks are 32 elements; the
+**K-quants use a 256-element superblock**. Any allowlisted tensor whose row is
+not divisible by the superblock is kept F32 (a warning is printed) — see the
+K-quant note below for `joint.pred.weight`.
+
+This section's allowlist and policy are identical to the converter's
+`f16`/`q8_0` path documented below.
 
 ---
 
@@ -119,6 +146,16 @@ batch 1, deterministic greedy.
 | `f32` | 437.5 MB (458,719,328 B) | 1.00× | 0.0 | 0.0 |
 | `f16` | 255.1 MB (267,452,512 B) | 0.58× | **0.0** | — |
 | `q8_0` | 169.6 MB (177,796,192 B) | 0.39× | **0.0** | **0.0** |
+| `q6_k`¹ | 148.7 MB (155,937,344 B) | 0.34× | **0.0** | — |
+| `q4_k`¹ | 125.3 MB (131,387,456 B) | 0.29× | **0.0** | — |
+
+¹ K-quants are produced by `parakeet-cli quantize` (not the Python converter).
+They quantize **155** of the 156 allowlisted tensors: `joint.pred.weight`
+(ggml `ne[0]` = 640, **not** divisible by the 256-element K-quant superblock) is
+kept F32. `joint.enc.weight` (`ne[0]` = 512) and `encoder.pre_encode.out.weight`
+(`ne[0]` = 2560) **are** quantized. The `q*_0` variants (block 32) quantize all
+156. Even `q4_k` reproduces the NeMo transcript byte-for-byte on the speech
+clip (WER 0.0).
 
 ### `nvidia/parakeet-tdt-0.6b-v2` (spot-check, 219 tensors quantized)
 
