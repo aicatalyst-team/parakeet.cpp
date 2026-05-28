@@ -1,6 +1,7 @@
 /build*/
 /.venv/
-/models/
+/models/*
+!/models/MANIFEST.md
 *.gguf
 __pycache__/
 *.pyc
