@@ -280,6 +280,55 @@ needed. The CLI `--decoder tdt` selects the transducer head and now routes to
 # -> MODEL nvidia/parakeet-rnnt-0.6b HEAD rnnt arch=rnnt xscaling=true WER 0.0000 ... PASS
 ```
 
+## Phase 3.5 — Remaining TDT / hybrid checkpoints (vs NeMo)
+
+The remaining published TDT and hybrid-TDT/CTC checkpoints, validated end-to-end
+with `scripts/validate_vs_nemo.py` on `tests/fixtures/speech.wav` (NeMo 2.7.3,
+CPU, batch 1, deterministic greedy). **No code change was required** — every one
+loaded purely from GGUF metadata (the loader already handles 80/128 mel,
+1024/8192 vocab, 1/2 LSTM layers, 24/42 layers, xscaling true/false, optional
+biases). The 1.1B TDT model is the first checkpoint NeMo restores as a *pure*
+`EncDecRNNTBPEModel` whose converter label is `tdt` (it has no `aux_ctc`), so it
+also exercises the standalone-`tdt`-arch routing — distinct from the `-0.6b-v2/-v3`
+hybrids that NeMo restores as RNNT but the converter labels `hybrid_tdt_ctc`.
+
+### Model `info` (config read from the GGUF metadata)
+
+| Model | HF id | arch | d_model / layers / heads | mels | conv norm | xscaling | durations | vocab |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| parakeet-tdt-0.6b (v1) | `nvidia/parakeet-tdt-0.6b` | — | **N/A — not published** | — | — | — | — | — |
+| parakeet-tdt-1.1b | `nvidia/parakeet-tdt-1.1b` | `tdt` | 1024 / 42 / 8 | 80 | batch_norm | false | `[0,1,2,3,4]` | 1024 |
+| parakeet-tdt_ctc-1.1b | `nvidia/parakeet-tdt_ctc-1.1b` | `hybrid_tdt_ctc` | 1024 / 42 / 8 | 80 | batch_norm | false | `[0,1,2,3,4]` | 1024 |
+
+The v1 `nvidia/parakeet-tdt-0.6b` is **not published** under that id (HF API 401 /
+converter 404; the only public `nvidia` `parakeet-tdt` repos are `-0.6b-v2`,
+`-0.6b-v3`, `-1.1b`, the `parakeet-tdt_ctc-*` hybrids, and `-tdt_ctc-0.6b-ja`).
+It was superseded by `parakeet-tdt-0.6b-v2`, already validated at WER 0 in Phase 3.
+
+### NeMo vs C++ transcripts + WER (`tests/fixtures/speech.wav`)
+
+| Model | head | NeMo | C++ | WER |
+| --- | --- | --- | --- | --- |
+| `parakeet-tdt-1.1b` | TDT (`--decoder tdt`) | `well i don't wish to see it any more observed phoebe turning away her eyes it is certainly very like the old portrait` | `well i don't wish to see it any more observed phoebe turning away her eyes it is certainly very like the old portrait` | **0.0** |
+| `parakeet-tdt_ctc-1.1b` | TDT (`--decoder tdt`) | `Well, I don't wish to see it any more, observed Phoebe, turning away her eyes. It is certainly very like the old portrait.` | `Well, I don't wish to see it any more, observed Phoebe, turning away her eyes. It is certainly very like the old portrait.` | **0.0** |
+| `parakeet-tdt_ctc-1.1b` | CTC (`--decoder ctc`) | `Well, I don't wish to see it any more, observed Phoebe, turning away her eyes. It is certainly very like the old portrait.` | `Well, I don't wish to see it any more, observed Phoebe, turning away her eyes. It is certainly very like the old portrait.` | **0.0** |
+
+All are **byte-for-byte identical** to NeMo (0 edits over 23 reference words). The
+pure-TDT `parakeet-tdt-1.1b` emits lowercase/unpunctuated text (its own training);
+the hybrid `parakeet-tdt_ctc-1.1b` emits cased/punctuated text on *both* of its
+heads — and the C++ port reproduces each head exactly, including the second head
+(CTC) of the hybrid via `--decoder ctc`. Reproduce:
+
+```bash
+.venv/bin/python scripts/convert_parakeet_to_gguf.py \
+    --model nvidia/parakeet-tdt_ctc-1.1b --output /tmp/val_tdtctc11.gguf
+./build/examples/cli/parakeet-cli info /tmp/val_tdtctc11.gguf   # arch=hybrid_tdt_ctc
+.venv/bin/python scripts/validate_vs_nemo.py \
+    --model nvidia/parakeet-tdt_ctc-1.1b --gguf /tmp/val_tdtctc11.gguf \
+    --audio tests/fixtures/speech.wav --head rnnt   # TDT head; --head ctc for the CTC head
+# -> MODEL nvidia/parakeet-tdt_ctc-1.1b HEAD rnnt arch=hybrid_tdt_ctc xscaling=false WER 0.0000 ... PASS
+```
+
 ## Test suite status
 
 `ctest --test-dir build --output-on-failure` (with `PARAKEET_TEST_GGUF`,
