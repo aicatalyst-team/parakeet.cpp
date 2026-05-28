@@ -23,14 +23,15 @@ add_subdirectory(third_party/ggml)
 
 set(PARAKEET_SRC
     src/parakeet.cpp
-    src/common.cpp)
+    src/common.cpp
+    src/audio_io.cpp)
 
 if(PARAKEET_SHARED)
   add_library(parakeet SHARED ${PARAKEET_SRC})
 else()
   add_library(parakeet STATIC ${PARAKEET_SRC})
 endif()
-target_include_directories(parakeet PUBLIC include PRIVATE src)
+target_include_directories(parakeet PUBLIC include PRIVATE src ${CMAKE_SOURCE_DIR}/third_party)
 target_link_libraries(parakeet PUBLIC ggml)
 
 if(PARAKEET_BUILD_CLI)
