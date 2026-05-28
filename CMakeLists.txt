@@ -23,6 +23,8 @@ add_subdirectory(third_party/ggml)
 
 set(PARAKEET_SRC
     src/parakeet.cpp
+    src/model.cpp
+    src/parakeet_capi.cpp
     src/common.cpp
     src/audio_io.cpp
     src/model_loader.cpp

@@ -1,0 +1,74 @@
+#include "parakeet_capi.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+// Flat C-API end-to-end test: load -> transcribe -> free.
+//
+// Loads the 110m anchor GGUF, transcribes tests/fixtures/speech.wav with the
+// TDT head (decoder == 2), and asserts the returned transcript equals the known
+// NeMo TDT reference. Also checks that loading a nonexistent path returns NULL
+// (no crash, exception contained at the boundary).
+//
+// LABEL model
+// WORKING_DIRECTORY (tests run from the project root; wav path is relative)
+//
+// Env:
+//   PARAKEET_TEST_GGUF   model weights (skip 77 if unset)
+
+static const char* kExpected =
+    "Well, I don't wish to see it any more, observed Phoebe, turning away her "
+    "eyes. It is certainly very like the old portrait.";
+
+int main() {
+    // ABI version must be a sane positive integer.
+    if (parakeet_capi_abi_version() < 1) {
+        std::fprintf(stderr, "test_capi: abi version < 1\n");
+        return 1;
+    }
+
+    // Loading a nonexistent model must fail gracefully (NULL, no crash).
+    parakeet_ctx* bad = parakeet_capi_load("/nonexistent/x.gguf");
+    if (bad != nullptr) {
+        std::fprintf(stderr, "test_capi: load of nonexistent path returned non-NULL\n");
+        parakeet_capi_free(bad);
+        return 1;
+    }
+
+    const char* gguf = std::getenv("PARAKEET_TEST_GGUF");
+    if (!gguf) {
+        std::fprintf(stderr, "test_capi: PARAKEET_TEST_GGUF not set; skip\n");
+        return 77;
+    }
+
+    parakeet_ctx* ctx = parakeet_capi_load(gguf);
+    if (!ctx) {
+        std::fprintf(stderr, "test_capi: parakeet_capi_load failed for %s\n", gguf);
+        return 1;
+    }
+
+    // decoder == 2 -> TDT/transducer head.
+    char* text = parakeet_capi_transcribe_path(ctx, "tests/fixtures/speech.wav", 2);
+    if (!text) {
+        std::fprintf(stderr, "test_capi: transcribe_path returned NULL: %s\n",
+                     parakeet_capi_last_error(ctx));
+        parakeet_capi_free(ctx);
+        return 1;
+    }
+
+    std::fprintf(stderr, "test_capi: got      = %s\n", text);
+    std::fprintf(stderr, "test_capi: expected = %s\n", kExpected);
+
+    const bool match = std::strcmp(text, kExpected) == 0;
+    parakeet_capi_free_string(text);
+    parakeet_capi_free(ctx);
+
+    if (!match) {
+        std::fprintf(stderr, "test_capi: MISMATCH vs NeMo TDT reference\n");
+        return 1;
+    }
+
+    std::fprintf(stderr, "test_capi: PASS (word-for-word match with NeMo TDT)\n");
+    return 0;
+}

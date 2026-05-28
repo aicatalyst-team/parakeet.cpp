@@ -28,18 +28,19 @@ pk_add_test(test_transcribe_tdt)
 pk_add_test(test_transcribe_0_6b)
 pk_add_test(test_transcribe_ctc)
 pk_add_test(test_transcribe_rnnt)
+pk_add_test(test_capi)
 set_tests_properties(test_model_loader test_mel test_subsampling test_relpos_attention
                      test_conformer test_encoder test_ctc test_prediction test_prediction_step
                      test_joint test_transducer_core test_tdt_greedy test_tokenizer test_transcribe
                      test_transcribe_speech test_transcribe_tdt test_transcribe_0_6b
-                     test_transcribe_ctc test_transcribe_rnnt
+                     test_transcribe_ctc test_transcribe_rnnt test_capi
                      PROPERTIES LABELS "model")
 # These tests read fixtures/baselines via paths relative to the project root.
 set_tests_properties(test_mel test_subsampling test_relpos_attention test_conformer
                      test_encoder test_ctc test_prediction test_prediction_step test_joint
                      test_transducer_core test_tdt_greedy test_tokenizer test_transcribe
                      test_transcribe_speech test_transcribe_tdt test_transcribe_0_6b
-                     test_transcribe_ctc test_transcribe_rnnt
+                     test_transcribe_ctc test_transcribe_rnnt test_capi
                      PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Python converter check (skips with exit 77 when the venv/model are absent).
