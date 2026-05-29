@@ -9,79 +9,79 @@
     {
       "threads": 1,
       "nemo": {
-        "rtfx": 12.669777363127078,
-        "median_latency_ms": 1704.0231509599835,
-        "peak_rss_mb": 2532.80078125
+        "rtfx": 12.38352657522079,
+        "median_latency_ms": 1753.3817265066318,
+        "peak_rss_mb": 2531.84375
       },
       "ours": {
-        "rtfx": 12.116240574738452,
-        "median_latency_ms": 1899.3835,
-        "peak_rss_mb": 1959.1796875
+        "rtfx": 12.37202118231488,
+        "median_latency_ms": 1776.646,
+        "peak_rss_mb": 1959.3359375
       }
     },
     {
       "threads": 2,
       "nemo": {
-        "rtfx": 20.489046189758163,
-        "median_latency_ms": 1008.940564992372,
-        "peak_rss_mb": 2539.38671875
+        "rtfx": 19.536536005504452,
+        "median_latency_ms": 1022.6933329831809,
+        "peak_rss_mb": 2692.26171875
       },
       "ours": {
-        "rtfx": 20.672647969918952,
-        "median_latency_ms": 1175.8835,
-        "peak_rss_mb": 1959.1328125
+        "rtfx": 21.377963251911282,
+        "median_latency_ms": 1055.839,
+        "peak_rss_mb": 1959.0234375
       }
     },
     {
       "threads": 4,
       "nemo": {
-        "rtfx": 27.12187074091184,
-        "median_latency_ms": 739.3151154974476,
-        "peak_rss_mb": 2543.26171875
+        "rtfx": 26.44609363857431,
+        "median_latency_ms": 758.1137395463884,
+        "peak_rss_mb": 2541.80078125
       },
       "ours": {
-        "rtfx": 31.970896329330888,
-        "median_latency_ms": 806.8895,
-        "peak_rss_mb": 1958.52734375
+        "rtfx": 34.187035669970314,
+        "median_latency_ms": 671.5690000000001,
+        "peak_rss_mb": 1958.78515625
       }
     },
     {
       "threads": 8,
       "nemo": {
-        "rtfx": 35.43699987312684,
-        "median_latency_ms": 504.80245251674205,
-        "peak_rss_mb": 2562.82421875
+        "rtfx": 34.373735207057656,
+        "median_latency_ms": 499.4088069652207,
+        "peak_rss_mb": 2560.19140625
       },
       "ours": {
-        "rtfx": 42.412451772721994,
-        "median_latency_ms": 641.2725,
-        "peak_rss_mb": 1958.14453125
+        "rtfx": 45.31138062934746,
+        "median_latency_ms": 528.1089999999999,
+        "peak_rss_mb": 1958.46484375
       }
     },
     {
       "threads": 16,
       "nemo": {
-        "rtfx": 37.23151583007099,
-        "median_latency_ms": 475.43398942798376,
-        "peak_rss_mb": 2567.67578125
+        "rtfx": 31.937045589926967,
+        "median_latency_ms": 539.1391525045037,
+        "peak_rss_mb": 2566.15234375
       },
       "ours": {
-        "rtfx": 44.92084927135636,
-        "median_latency_ms": 613.824,
-        "peak_rss_mb": 1957.62890625
+        "rtfx": 45.14432946743246,
+        "median_latency_ms": 567.116,
+        "peak_rss_mb": 1957.42578125
       }
     },
     {
       "threads": 20,
       "nemo": {
-        "rtfx": 28.200686729601724,
-        "median_latency_ms": 776.8994314828888,
-        "peak_rss_mb": 2576.47265625
+        "rtfx": 7.666067217258126,
+        "median_latency_ms": 8145.103665476199,
+        "peak_rss_mb": 2575.98046875
       },
       "ours": {
-        "rtfx": 31.484917724105145,
-        "median_latency_ms": 1431.617,
-        "peak_rss_mb": 1957.29296875
+        "rtfx": 9.208542656420398,
+        "median_latency_ms": 6105.916499999999,
+        "peak_rss_mb": 1957.65234375
       }
     }
   ]

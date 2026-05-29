@@ -117,6 +117,12 @@ def load_refs(manifest: Path) -> dict[str, str]:
 # Conversion
 # ---------------------------------------------------------------------------
 
+# dtypes the Python converter produces directly (applies its quant allowlist).
+CONVERTER_DTYPES = {"f32", "f16", "q8_0"}
+# dtypes produced by `parakeet-cli quantize <in> <out> <type>` from an f32 GGUF.
+CLI_QUANT_DTYPES = {"q4_0", "q5_0", "q4_k", "q5_k", "q6_k"}
+
+
 def convert(hf_id: str, dtype: str, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -132,6 +138,38 @@ def convert(hf_id: str, dtype: str, out_path: Path) -> None:
             f"converter failed (rc={res.returncode})\ncmd: {' '.join(cmd)}\n"
             f"stderr:\n{res.stderr[-2000:]}"
         )
+
+
+def quantize_cli(cli: Path, src_f32: Path, out_path: Path, dtype: str) -> None:
+    """Produce a K-quant (q4_k/q5_k/q6_k/q4_0/q5_0) GGUF from an f32 GGUF via
+    the CLI `quantize` subcommand (same allowlist as the converter's q8_0)."""
+    cmd = [str(cli), "quantize", str(src_f32), str(out_path), dtype]
+    print(f"  [quantize] {src_f32.name} -> {out_path.name} ({dtype}) …", flush=True)
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"quantize failed (rc={res.returncode})\ncmd: {' '.join(cmd)}\n"
+            f"stderr:\n{res.stderr[-2000:]}"
+        )
+
+
+def ensure_gguf(hf_id: str, model_name: str, dtype: str, models_dir: Path,
+                cli: Path) -> Path:
+    """Ensure a GGUF for (model, dtype) exists; return its path. K-quants are
+    built from the f32 GGUF (converted first if needed)."""
+    out = models_dir / f"{model_name}.{dtype}.gguf"
+    if out.exists():
+        return out
+    if dtype in CONVERTER_DTYPES:
+        convert(hf_id, dtype, out)
+    elif dtype in CLI_QUANT_DTYPES:
+        f32 = models_dir / f"{model_name}.f32.gguf"
+        if not f32.exists():
+            convert(hf_id, "f32", f32)
+        quantize_cli(cli, f32, out, dtype)
+    else:
+        raise ValueError(f"unknown dtype '{dtype}'")
+    return out
 
 
 def count_checkpoint_tensors(gguf_path: Path) -> int:
@@ -265,19 +303,32 @@ def benchmark_model(
     cli: Path,
     models_dir: Path,
     keep_models: bool,
+    skip_nemo: bool = False,
+    out_dir: Path | None = None,
 ) -> dict:
     hf_id, head = MODELS[key]
     model_name = hf_id.split("/", 1)[1]  # e.g. parakeet-tdt_ctc-110m
-    print(f"=== {model_name}  (head={head}, threads={threads}) ===", flush=True)
+    print(f"=== {model_name}  (head={head}, threads={threads}"
+          f"{', skip-nemo' if skip_nemo else ''}) ===", flush=True)
 
-    # Convert each requested dtype once (independent of manifest).
+    # When skipping NeMo, reuse the NeMo block (and n_files/total_audio_sec) from
+    # the previously-committed result — NeMo is the unchanged reference, and its
+    # CPU pass on the 1.1B models is the slow part. Only OUR engine is re-measured.
+    prior: dict | None = None
+    if skip_nemo:
+        prior_path = (out_dir or Path("benchmarks/results")) / f"{model_name}.json"
+        if not prior_path.exists():
+            raise RuntimeError(
+                f"--skip-nemo: no prior result to reuse NeMo from at {prior_path}")
+        prior = json.loads(prior_path.read_text())
+
+    # Convert each requested dtype once (independent of manifest). f32/f16/q8_0
+    # come from the Python converter; q4_k/q5_k/q6_k from `cli quantize` off f32.
     ggufs: dict[str, Path] = {}
     gguf_size_mb: dict[str, float] = {}
     ckpt_tensors: dict[str, int] = {}
     for dtype in dtypes:
-        gguf = models_dir / f"{model_name}.{dtype}.gguf"
-        if not gguf.exists():
-            convert(hf_id, dtype, gguf)
+        gguf = ensure_gguf(hf_id, model_name, dtype, models_dir, cli)
         ggufs[dtype] = gguf
         gguf_size_mb[dtype] = gguf.stat().st_size / (1024.0 * 1024.0)
         ckpt_tensors[dtype] = count_checkpoint_tensors(gguf)
@@ -299,15 +350,40 @@ def benchmark_model(
         refs = load_refs(manifest)
         print(f"  -- manifest: {man_key} ({len(refs)} files) --", flush=True)
 
-        # NeMo pass once per manifest (head is fixed).
-        nemo = run_nemo(hf_id, head, manifest, threads)
-        nemo_metrics = compute_metrics(nemo["files"], refs)
+        if skip_nemo:
+            # Reuse the committed NeMo block verbatim (unchanged reference).
+            assert prior is not None
+            prior_man = prior["manifests"][man_key]
+            nemo_block = prior_man["nemo"]
+            nemo_files = nemo_block["files"]
+            n_files = prior_man["n_files"]
+            total_audio_sec = prior_man["total_audio_sec"]
+            nemo_version = nemo_block.get("nemo_version")
+        else:
+            # NeMo pass once per manifest (head is fixed).
+            nemo = run_nemo(hf_id, head, manifest, threads)
+            nemo_metrics = compute_metrics(nemo["files"], refs)
+            nemo_files = nemo["files"]
+            n_files = len(nemo["files"])
+            total_audio_sec = nemo_metrics["total_audio_sec"]
+            nemo_version = nemo.get("nemo_version")
+            nemo_block = {
+                **nemo_metrics,
+                "peak_rss_mb": nemo["peak_rss_mb"],
+                "load_s": nemo.get("load_s"),
+                "nemo_version": nemo_version,
+                "files": [
+                    {"path": f["path"], "audio_sec": f["audio_sec"],
+                     "proc_s": f["proc_s"], "text": f["text"]}
+                    for f in nemo["files"]
+                ],
+            }
 
         per_dtype: dict[str, dict] = {}
         for dtype in dtypes:
             ours = run_ours(ggufs[dtype], head, manifest, threads, cli)
             our_metrics = compute_metrics(ours["files"], refs)
-            agree = agreement_wer(nemo["files"], ours["files"])
+            agree = agreement_wer(nemo_files, ours["files"])
             per_dtype[dtype] = {
                 **our_metrics,
                 "peak_rss_mb": ours["peak_rss_mb"],
@@ -329,34 +405,31 @@ def benchmark_model(
             )
 
         result["manifests"][man_key] = {
-            "n_files": len(nemo["files"]),
-            "total_audio_sec": nemo_metrics["total_audio_sec"],
-            "nemo": {
-                **nemo_metrics,
-                "peak_rss_mb": nemo["peak_rss_mb"],
-                "load_s": nemo.get("load_s"),
-                "nemo_version": nemo.get("nemo_version"),
-                "files": [
-                    {"path": f["path"], "audio_sec": f["audio_sec"],
-                     "proc_s": f["proc_s"], "text": f["text"]}
-                    for f in nemo["files"]
-                ],
-            },
+            "n_files": n_files,
+            "total_audio_sec": total_audio_sec,
+            "nemo": nemo_block,
             "ours": per_dtype,
         }
-        result.setdefault("nemo_version", nemo.get("nemo_version"))
+        result.setdefault("nemo_version", nemo_version)
         print(
-            f"     [nemo] RTFx={_fmt(nemo_metrics['rtfx'])} "
-            f"WERtruth={_fmt(nemo_metrics['wer_vs_truth'])} "
-            f"RSS={_fmt(nemo['peak_rss_mb'])}MB",
+            f"     [nemo{'*reused' if skip_nemo else ''}] "
+            f"RTFx={_fmt(nemo_block.get('rtfx'))} "
+            f"WERtruth={_fmt(nemo_block.get('wer_vs_truth'))} "
+            f"RSS={_fmt(nemo_block.get('peak_rss_mb'))}MB",
             flush=True,
         )
 
     # Prune GGUFs unless asked to keep them (HF cache stays — we have headroom).
+    # Includes any f32 base built solely to seed K-quants (not in `ggufs`).
     if not keep_models:
-        for gguf in ggufs.values():
-            gguf.unlink(missing_ok=True)
-        print(f"  [prune] removed {len(ggufs)} GGUF(s) for {model_name}", flush=True)
+        to_remove = set(ggufs.values())
+        to_remove.add(models_dir / f"{model_name}.f32.gguf")
+        n = 0
+        for gguf in to_remove:
+            if gguf.exists():
+                gguf.unlink()
+                n += 1
+        print(f"  [prune] removed {n} GGUF(s) for {model_name}", flush=True)
 
     return result
 
@@ -449,6 +522,12 @@ def main() -> int:
         help="do not prune the converted GGUFs after each model",
     )
     ap.add_argument(
+        "--skip-nemo", action="store_true",
+        help="reuse the NeMo block from the existing results JSON (unchanged "
+             "reference) and only re-measure OUR engine. Requires a prior result "
+             "per model in --out.",
+    )
+    ap.add_argument(
         "--thread-sweep", default="",
         help="CSV of thread counts (e.g. 1,2,4,8,20) to sweep on one model",
     )
@@ -493,6 +572,7 @@ def main() -> int:
     for key in keys:
         result = benchmark_model(
             key, manifests, dtypes, args.threads, cli, models_dir, args.keep_models,
+            skip_nemo=args.skip_nemo, out_dir=out_dir,
         )
         out_path = out_dir / f"{result['model']}.json"
         out_path.write_text(json.dumps(result, indent=2))
