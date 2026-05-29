@@ -103,10 +103,11 @@ static ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
         //   scale = g / sqrt(var+eps); shift = b - mean*scale.  Computed host-side.
         std::vector<float>& sc = pool.alloc_f32(D);
         std::vector<float>& sh = pool.alloc_f32(D);
-        const float* g = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.weight"));
-        const float* bb = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.bias"));
-        const float* m = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.running_mean"));
-        const float* var = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.running_var"));
+        std::vector<float> g, bb, m, var;
+        pk::weight_to_host_f32(ml, (pre + "conv.batch_norm.weight").c_str(), g);
+        pk::weight_to_host_f32(ml, (pre + "conv.batch_norm.bias").c_str(), bb);
+        pk::weight_to_host_f32(ml, (pre + "conv.batch_norm.running_mean").c_str(), m);
+        pk::weight_to_host_f32(ml, (pre + "conv.batch_norm.running_var").c_str(), var);
         for (int cc = 0; cc < D; ++cc) {
             sc[cc] = g[cc] / std::sqrt(var[cc] + bn_eps);
             sh[cc] = bb[cc] - m[cc] * sc[cc];

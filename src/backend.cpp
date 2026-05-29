@@ -273,4 +273,13 @@ ggml_tensor* clone_weight_opt(ggml_context* ctx, const ModelLoader& ml,
     return clone_weight(ctx, ml, name);
 }
 
+void weight_to_host_f32(const ModelLoader& ml, const char* name, std::vector<float>& out) {
+    ensure_weights_realized(ml);
+    ggml_tensor* t = ml.tensor(name);
+    GGML_ASSERT(t && "weight_to_host_f32: missing tensor");
+    GGML_ASSERT(t->type == GGML_TYPE_F32 && "weight_to_host_f32: tensor not f32");
+    out.resize((size_t)ggml_nelements(t));
+    ggml_backend_tensor_get(t, out.data(), 0, ggml_nbytes(t));
+}
+
 } // namespace pk

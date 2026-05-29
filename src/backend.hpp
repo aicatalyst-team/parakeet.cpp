@@ -143,4 +143,10 @@ ggml_tensor* clone_weight_opt(ggml_context* ctx, const ModelLoader& ml,
 // exposed so the model/test load path can realize weights up front.
 void ensure_weights_realized(const ModelLoader& ml);
 
+// Copy a weight tensor's f32 contents into `out` on the host, regardless of
+// whether the weight lives in CPU or device (e.g. CUDA) memory. Ensures weights
+// are realized first. Use this for host-side computation that needs raw floats
+// (preprocessing, batch-norm folding) — NOT for graph leaves (use clone_weight).
+void weight_to_host_f32(const ModelLoader& ml, const char* name, std::vector<float>& out);
+
 } // namespace pk

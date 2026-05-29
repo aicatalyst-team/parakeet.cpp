@@ -304,10 +304,11 @@ static ggml_tensor* build_stream_layer(
     } else {
         std::vector<float>& sc_host = pool.alloc_f32(D);
         std::vector<float>& sh_host = pool.alloc_f32(D);
-        const float* g = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.weight"));
-        const float* bb = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.bias"));
-        const float* mm = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.running_mean"));
-        const float* var = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.running_var"));
+        std::vector<float> g, bb, mm, var;
+        pk::weight_to_host_f32(ml, (pre + "conv.batch_norm.weight").c_str(), g);
+        pk::weight_to_host_f32(ml, (pre + "conv.batch_norm.bias").c_str(), bb);
+        pk::weight_to_host_f32(ml, (pre + "conv.batch_norm.running_mean").c_str(), mm);
+        pk::weight_to_host_f32(ml, (pre + "conv.batch_norm.running_var").c_str(), var);
         for (int cc2 = 0; cc2 < D; ++cc2) {
             sc_host[cc2] = g[cc2] / std::sqrt(var[cc2] + 1e-5f);
             sh_host[cc2] = bb[cc2] - mm[cc2] * sc_host[cc2];

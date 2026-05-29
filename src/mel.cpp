@@ -1,10 +1,12 @@
 #include "mel.hpp"
 #include "fft.hpp"
+#include "backend.hpp"
 #include "ggml.h"
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <vector>
 
 namespace pk {
 
@@ -30,8 +32,10 @@ MelKernel::MelKernel(const ModelLoader& ml) {
     window_.assign(n_fft_, 0.0f);
     ggml_tensor* w = ml.tensor("preprocessor.featurizer.window");
     if (w) {
+        std::vector<float> wbuf;
+        pk::weight_to_host_f32(ml, "preprocessor.featurizer.window", wbuf);
         const int wlen = (int)w->ne[0];
-        const float* wd = (const float*)w->data;
+        const float* wd = wbuf.data();
         if (wlen == n_fft_) {
             std::memcpy(window_.data(), wd, sizeof(float) * n_fft_);
         } else {
@@ -49,7 +53,9 @@ MelKernel::MelKernel(const ModelLoader& ml) {
     fb_.assign((size_t)n_mels_ * n_bins_, 0.0f);
     ggml_tensor* fb = ml.tensor("preprocessor.featurizer.fb");
     if (fb) {
-        const float* fd = (const float*)fb->data;
+        std::vector<float> fbuf;
+        pk::weight_to_host_f32(ml, "preprocessor.featurizer.fb", fbuf);
+        const float* fd = fbuf.data();
         std::memcpy(fb_.data(), fd, sizeof(float) * (size_t)n_mels_ * n_bins_);
     }
 }

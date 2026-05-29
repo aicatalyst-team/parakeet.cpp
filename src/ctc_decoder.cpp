@@ -46,6 +46,13 @@ void CTCDecoder::forward(const std::vector<float>& enc, int d_model, int T,
 
     const ModelLoader& ml = ml_;
 
+    // Realize the loader's weights (CPU or device buffer) so the CTC head weight
+    // and bias tensors have ->data/->buffer set and can be referenced directly as
+    // graph leaves (the gallocr treats them as already-allocated). On a device
+    // backend their ->data is a device pointer, so they must NEVER be copied as a
+    // host source — referencing them as leaves keeps the read on the backend.
+    pk::ensure_weights_realized(ml);
+
     bool ok = pk::run_graph(mem_bytes, /*n_threads=*/4,
         [&](ggml_context* ctx) -> ggml_tensor* {
             // ---- Input: enc [d_model, T] row-major, enc[c*T + t] ----
@@ -64,23 +71,18 @@ void CTCDecoder::forward(const std::vector<float>& enc, int d_model, int T,
             // So d_model (ne[0]) is fastest → correct for ggml_mul_mat contraction on ne[0].
             ggml_tensor* w3 = ctc_head_tensor(ml, "weight");
             assert(w3->type == GGML_TYPE_F32);
-            // Bring the weight into the graph as an input (loader bytes copied
-            // after alloc); reshape from [ne0=1, ne1=d_model, ne2=V] to
-            // [ne0=d_model, ne1=V] (reshape needs a contiguous, allocated src).
-            const int nd_w = ggml_n_dims(w3);
-            int64_t ne_w[4] = {1, 1, 1, 1};
-            for (int i = 0; i < nd_w; ++i) ne_w[i] = w3->ne[i];
-            ggml_tensor* wclone = pk::graph_input_tensor(ctx, GGML_TYPE_F32, nd_w,
-                                      ne_w, w3->data, ggml_nbytes(w3));
-            ggml_tensor* W = ggml_reshape_2d(ctx, wclone, d_model, V);
+            // Reference the realized weight leaf DIRECTLY (it has ->data/->buffer
+            // from ensure_weights_realized, so the gallocr treats it as already
+            // allocated and never copies it — works for CPU and device buffers).
+            // Reshape from [ne0=1, ne1=d_model, ne2=V] to [ne0=d_model, ne1=V].
+            ggml_tensor* W = ggml_reshape_2d(ctx, w3, d_model, V);
             // W: ne[0]=d_model (fastest), ne[1]=V ✓
 
             // ---- Bias: [V] ----
+            // Reference the realized bias leaf directly (already [V] f32).
             ggml_tensor* bsrc = ctc_head_tensor(ml, "bias");
             assert(bsrc->type == GGML_TYPE_F32);
-            int64_t b_ne[1] = {V};
-            ggml_tensor* b = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, b_ne,
-                                 bsrc->data, (size_t)V * sizeof(float));
+            ggml_tensor* b = bsrc;
 
             // ---- Linear: ggml_mul_mat(W, xt) ----
             // ggml_mul_mat(A, B): A[ne0(A), ne1(A)], B[ne0(B), ne1(B)]
