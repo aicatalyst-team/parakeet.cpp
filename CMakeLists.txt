@@ -63,6 +63,7 @@ set(PARAKEET_SRC
     src/ggml_graph.cpp
     src/fft.cpp
     src/mel.cpp
+    src/mel_gpu.cpp
     src/subsampling.cpp
     src/relpos_attention.cpp
     src/conformer.cpp

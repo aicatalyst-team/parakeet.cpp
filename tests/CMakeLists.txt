@@ -11,6 +11,7 @@ pk_add_test(test_audio_io)
 pk_add_test(test_model_loader)
 pk_add_test(test_fft)
 pk_add_test(test_mel)
+pk_add_test(test_mel_gpu)
 pk_add_test(test_subsampling)
 pk_add_test(test_relpos_attention)
 pk_add_test(test_conformer)
@@ -39,7 +40,7 @@ pk_add_test(test_streaming_mel)
 pk_add_test(test_capi)
 pk_add_test(test_capi_stream)
 pk_add_test(test_capi_timestamps)
-set_tests_properties(test_model_loader test_mel test_subsampling test_relpos_attention
+set_tests_properties(test_model_loader test_mel test_mel_gpu test_subsampling test_relpos_attention
                      test_conformer test_conv_eou test_encoder test_encoder_eou
                      test_streaming_encoder test_ctc test_prediction
                      test_prediction_step
@@ -51,7 +52,7 @@ set_tests_properties(test_model_loader test_mel test_subsampling test_relpos_att
                      test_capi_timestamps
                      PROPERTIES LABELS "model")
 # These tests read fixtures/baselines via paths relative to the project root.
-set_tests_properties(test_mel test_subsampling test_relpos_attention test_conformer
+set_tests_properties(test_mel test_mel_gpu test_subsampling test_relpos_attention test_conformer
                      test_conv_eou test_encoder test_encoder_eou test_streaming_encoder
                      test_ctc test_prediction test_prediction_step
                      test_joint

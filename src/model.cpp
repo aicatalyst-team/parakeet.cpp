@@ -2,6 +2,7 @@
 
 #include "audio_io.hpp"
 #include "mel.hpp"
+#include "mel_gpu.hpp"
 #include "encoder.hpp"
 #include "ctc_decoder.hpp"
 #include "search.hpp"
@@ -13,6 +14,7 @@
 #include "transcription.hpp"
 #include "decode_types.hpp"
 #include "backend.hpp"
+#include "ggml_graph.hpp"
 
 #include <stdexcept>
 #include <vector>
@@ -49,11 +51,18 @@ std::string Model::transcribe_16k(const std::vector<float>& pcm16k,
                                   Decoder decoder) const {
     const ParakeetConfig& cfg = loader_.config();
 
-    // 1. Log-mel front end -> feats [n_mels, T].
-    MelFrontend mel(loader_);
+    // 1. Log-mel front end -> feats [n_mels, T]. On a non-CPU backend run the
+    //    heavy STFT/power/filterbank/log on the backend (GPU) via GpuMel; on CPU
+    //    keep the byte-identical FFT-based MelFrontend.
     std::vector<float> feats;
     int n_mels = 0, T = 0;
-    mel.compute(pcm16k, feats, n_mels, T);
+    if (std::string(pk::global_backend().device_name()) != "cpu") {
+        GpuMel gmel(loader_);
+        gmel.compute(pcm16k, feats, n_mels, T);
+    } else {
+        MelFrontend mel(loader_);
+        mel.compute(pcm16k, feats, n_mels, T);
+    }
 
     // 2. FastConformer encoder -> enc_out [d_model, Tout] (channels-first).
     Encoder encoder(loader_);
@@ -124,11 +133,18 @@ Transcription Model::transcribe_16k_with_timestamps(
     const float frame_sec =
         (float)cfg.hop_length * (float)cfg.subsampling_factor / (float)cfg.sample_rate;
 
-    // 1. Log-mel front end -> feats [n_mels, T].
-    MelFrontend mel(loader_);
+    // 1. Log-mel front end -> feats [n_mels, T]. On a non-CPU backend run the
+    //    heavy STFT/power/filterbank/log on the backend (GPU) via GpuMel; on CPU
+    //    keep the byte-identical FFT-based MelFrontend.
     std::vector<float> feats;
     int n_mels = 0, T = 0;
-    mel.compute(pcm16k, feats, n_mels, T);
+    if (std::string(pk::global_backend().device_name()) != "cpu") {
+        GpuMel gmel(loader_);
+        gmel.compute(pcm16k, feats, n_mels, T);
+    } else {
+        MelFrontend mel(loader_);
+        mel.compute(pcm16k, feats, n_mels, T);
+    }
 
     // 2. FastConformer encoder -> enc_out [d_model, Tout] (channels-first).
     Encoder encoder(loader_);
