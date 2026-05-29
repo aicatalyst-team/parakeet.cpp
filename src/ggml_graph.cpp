@@ -23,7 +23,6 @@ namespace {
 // which routes through this single Backend, so the per-call ggml_init/ggml_free
 // churn is eliminated without threading a Backend handle through every layer.
 // Task 2+ will fuse graphs on top of the same Backend.
-std::once_flag g_backend_once;
 std::unique_ptr<Backend> g_backend;
 int g_backend_threads = 0;
 // Serializes access to the process-global Backend. The old run_graph allocated
@@ -48,12 +47,15 @@ std::mutex g_backend_mutex;
 constexpr int kDefaultThreads = 8;
 
 Backend& global_backend() {
-    std::call_once(g_backend_once, [] {
+    // Lazy create (reset-safe: shutdown_backend() can free it, and a later call
+    // recreates it). Always reached under g_backend_mutex (run_graph holds it)
+    // or before any inference thread exists, so a plain null-check is sufficient.
+    if (!g_backend) {
         const int g = g_num_threads.load(std::memory_order_relaxed);
         const int n = g > 0 ? g : kDefaultThreads;
         g_backend = std::make_unique<Backend>(n);
         g_backend_threads = n;
-    });
+    }
     // Honor a late --threads override: keep the live backend's thread count in
     // sync with the global override (the override is set once before inference).
     const int g = g_num_threads.load(std::memory_order_relaxed);
@@ -62,6 +64,18 @@ Backend& global_backend() {
         g_backend_threads = g;
     }
     return *g_backend;
+}
+
+void shutdown_backend() {
+    // Free the process-global backend explicitly. Required for GPU backends: the
+    // backend (and its gallocr's device buffer) must be released while the CUDA/
+    // etc. driver is still alive. Relying on static destruction frees it during
+    // process exit, AFTER the driver's atexit handler, which aborts with
+    // "driver shutting down". Call from main() before returning (model objects,
+    // which hold their own device weight buffers, must already be destroyed).
+    std::lock_guard<std::mutex> lock(g_backend_mutex);
+    g_backend.reset();
+    g_backend_threads = 0;
 }
 
 bool run_graph(size_t /*mem_bytes*/, int n_threads,

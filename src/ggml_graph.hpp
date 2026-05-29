@@ -39,4 +39,10 @@ class Backend;
 // on the SAME CPU backend that graphs run on.
 Backend& global_backend();
 
+// Free the process-global backend. Call once at program exit (after all model
+// objects are destroyed) so GPU backends release device memory while the driver
+// is still alive — otherwise static destruction frees it after the CUDA atexit
+// handler and aborts. A later global_backend() call recreates it.
+void shutdown_backend();
+
 } // namespace pk

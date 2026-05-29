@@ -626,14 +626,25 @@ static int cmd_bench(int argc, char** argv) {
     return 0;
 }
 
+// Run a subcommand, then free the process-global backend while the GPU driver is
+// still alive (the subcommand's local Model is already destroyed by the time it
+// returns, releasing its device weight buffer). Avoids the CUDA "driver shutting
+// down" abort caused by static-destruction teardown ordering.
+static int run_and_shutdown(int (*fn)(int, char**), int argc, char** argv) {
+    int rc = fn(argc, argv);
+    pk::shutdown_backend();
+    return rc;
+}
+
 int main(int argc, char** argv) {
-    if (argc >= 3 && std::strcmp(argv[1], "info") == 0) return cmd_info(argv[2]);
+    if (argc >= 3 && std::strcmp(argv[1], "info") == 0)
+        return run_and_shutdown([](int, char** a) { return cmd_info(a[0]); }, 1, argv + 2);
     if (argc >= 2 && std::strcmp(argv[1], "transcribe") == 0)
-        return cmd_transcribe(argc - 2, argv + 2);
+        return run_and_shutdown(cmd_transcribe, argc - 2, argv + 2);
     if (argc >= 2 && std::strcmp(argv[1], "quantize") == 0)
-        return cmd_quantize(argc - 2, argv + 2);
+        return run_and_shutdown(cmd_quantize, argc - 2, argv + 2);
     if (argc >= 2 && std::strcmp(argv[1], "bench") == 0)
-        return cmd_bench(argc - 2, argv + 2);
+        return run_and_shutdown(cmd_bench, argc - 2, argv + 2);
     std::fprintf(stderr,
         "usage:\n"
         "  parakeet-cli info <model.gguf>\n"
