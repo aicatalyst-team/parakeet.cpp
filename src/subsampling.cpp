@@ -1,30 +1,20 @@
 #include "subsampling.hpp"
 #include "ggml_graph.hpp"
+#include "backend.hpp"
 #include "ggml.h"
 #include <cassert>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 namespace pk {
 
-// Copy a tensor loaded from the GGUF (lives in the loader context) into a new
-// tensor inside the compute context `ctx`, preserving its ne[] layout, type, and
-// raw data. Weights in the GGUF have ggml ne = reverse of the torch shape, which
-// is exactly the layout ggml's conv kernels expect ([KW,KH,IC,OC]). The conv
-// kernels here stay F32 (the converter never quantizes them, and ggml_conv_2d
-// has no quantized path); only the final out.weight projection is allowlisted
-// and may be f16/q8_0, fed straight into ggml_mul_mat which dequantizes src0.
-static ggml_tensor* clone_weight(ggml_context* ctx, const ModelLoader& ml,
-                                 const char* name) {
-    ggml_tensor* src = ml.tensor(name);
-    assert(src && "missing tensor");
-    const int nd = ggml_n_dims(src);
-    int64_t ne[4] = {1,1,1,1};
-    for (int i = 0; i < nd; ++i) ne[i] = src->ne[i];
-    ggml_tensor* dst = ggml_new_tensor(ctx, src->type, nd, ne);
-    std::memcpy(dst->data, src->data, ggml_nbytes(src));
-    return dst;
-}
+// Weights from the GGUF (loader context) are brought into the graph as inputs
+// via the shared pk::clone_weight (backend.cpp): a same-type/same-ne input
+// tensor whose loader bytes are copied in AFTER the gallocr allocates it. The
+// conv kernels stay F32 (the converter never quantizes them); only out.weight
+// is allowlisted and may be f16/q8_0, fed into ggml_mul_mat which dequantizes
+// src0. GGUF ne is reverse of the torch shape == ggml's [KW,KH,IC,OC] layout.
 
 Subsampling::Subsampling(const ModelLoader& ml)
     : ml_(ml) {
@@ -82,19 +72,27 @@ void Subsampling::forward(const std::vector<float>& mel, int n_mels, int T,
 
     const ModelLoader& ml = ml_;
 
+    // --- Input (host-side): ggml conv data layout is [W=feat, H=T, IC=1, N=1].
+    // NeMo conv input is [B,1,T,feat] (H=T, W=feat). We must feed
+    // x[t*F + f] = mel(feat=f, time=t). mel is feat-major [F,T] (mel[m*T + t])
+    // so transpose into time-major here, then feed it as a graph input.
+    std::vector<float> x_host((size_t)F * T);
+    for (int t = 0; t < T; ++t)
+        for (int f = 0; f < F; ++f)
+            x_host[(size_t)t * F + f] = mel[(size_t)f * T + t];
+
+    // Host-built masks (filled inside the build lambda if needed; kept alive
+    // for the whole call so the deferred input copies stay valid). Use stable
+    // storage (pointers) since several time masks may be registered at once.
+    std::vector<std::unique_ptr<std::vector<float>>> mask_hosts;
+    std::vector<float> outmask_host;
+
     bool ok = pk::run_graph(mem_bytes, /*n_threads*/4,
         [&](ggml_context* ctx) -> ggml_tensor* {
-            // --- Input: ggml conv data layout is b: [W=feat, H=T, IC=1, N=1].
-            // NeMo conv input is [B,1,T,feat] (H=T, W=feat). We must feed
-            // x[t*F + f] = mel(feat=f, time=t). mel is feat-major [F,T]
-            // (mel[m*T + t]) so transpose into time-major here.
-            ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, F, T, 1, 1);
-            {
-                float* xd = (float*)x->data;
-                for (int t = 0; t < T; ++t)
-                    for (int f = 0; f < F; ++f)
-                        xd[(size_t)t * F + f] = mel[(size_t)f * T + t];
-            }
+            int64_t x_ne[4] = {F, T, 1, 1};
+            ggml_tensor* x = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 4, x_ne,
+                                                    x_host.data(),
+                                                    x_host.size() * sizeof(float));
 
             // Subsampling conv padding. NeMo dw_striding uses k=3, s=2 on each
             // stage; the padding differs by model:
@@ -125,9 +123,12 @@ void Subsampling::forward(const std::vector<float>& mel, int n_mels, int T,
             auto mask_time = [&](ggml_tensor* t, int valid_t) -> ggml_tensor* {
                 const int H = (int)t->ne[1];
                 if (valid_t >= H) return t;
-                ggml_tensor* tm = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
-                float* md = (float*)tm->data;
+                mask_hosts.emplace_back(new std::vector<float>(H));
+                std::vector<float>& md = *mask_hosts.back();
                 for (int h = 0; h < H; ++h) md[h] = (h < valid_t) ? 1.0f : 0.0f;
+                int64_t m_ne[4] = {1, H, 1, 1};
+                ggml_tensor* tm = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 4,
+                                      m_ne, md.data(), md.size() * sizeof(float));
                 return ggml_mul(ctx, t, tm); // broadcast over ne0(W), ne2(C), ne3
             };
             // Per-stage valid time lengths (NeMo calc_length on the time axis).
@@ -214,9 +215,13 @@ void Subsampling::forward(const std::vector<float>& mel, int n_mels, int T,
                 // Multiply by a time mask [1, T'] (1.0 valid, 0.0 masked), which
                 // broadcasts over the C*F' feature dim. Must be applied in-graph
                 // (flat is computed at execute time, not build time).
-                ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, Tp);
-                float* md = (float*)mask->data;
-                for (int t = 0; t < Tp; ++t) md[t] = (t < valid_out) ? 1.0f : 0.0f;
+                outmask_host.assign(Tp, 0.0f);
+                for (int t = 0; t < Tp; ++t)
+                    outmask_host[t] = (t < valid_out) ? 1.0f : 0.0f;
+                int64_t mk_ne[2] = {1, Tp};
+                ggml_tensor* mask = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2,
+                                        mk_ne, outmask_host.data(),
+                                        outmask_host.size() * sizeof(float));
                 flat = ggml_mul(ctx, flat, mask);
             }
 

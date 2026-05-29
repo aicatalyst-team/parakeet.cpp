@@ -1,5 +1,6 @@
 #include "ctc_decoder.hpp"
 #include "ggml_graph.hpp"
+#include "backend.hpp"
 #include "ggml.h"
 #include <cassert>
 #include <cstring>
@@ -52,8 +53,9 @@ void CTCDecoder::forward(const std::vector<float>& enc, int d_model, int T,
             // BUT our enc is row-major [d_model, T] = enc[c*T + t], i.e. T is fastest.
             // To match ggml layout where ne[0] is fastest, we store enc with ne[0]=T, ne[1]=d_model:
             //   ggml tensor: ne[0]=T, ne[1]=d_model → memory enc[t + T*d] = enc[d*T + t] ✓
-            ggml_tensor* xt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, d_model);
-            std::memcpy(xt->data, enc.data(), (size_t)d_model * T * sizeof(float));
+            int64_t xt_ne[2] = {T, d_model};
+            ggml_tensor* xt = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, xt_ne,
+                                  enc.data(), (size_t)d_model * T * sizeof(float));
             // xt: ne[0]=T (fastest), ne[1]=d_model → memory enc[d*T + t] ✓
 
             // ---- Weight: GGUF stores ne[0]=1, ne[1]=d_model, ne[2]=V ----
@@ -62,22 +64,23 @@ void CTCDecoder::forward(const std::vector<float>& enc, int d_model, int T,
             // So d_model (ne[0]) is fastest → correct for ggml_mul_mat contraction on ne[0].
             ggml_tensor* w3 = ctc_head_tensor(ml, "weight");
             assert(w3->type == GGML_TYPE_F32);
-            // Clone weight into compute context preserving ne[] layout.
+            // Bring the weight into the graph as an input (loader bytes copied
+            // after alloc); reshape from [ne0=1, ne1=d_model, ne2=V] to
+            // [ne0=d_model, ne1=V] (reshape needs a contiguous, allocated src).
             const int nd_w = ggml_n_dims(w3);
             int64_t ne_w[4] = {1, 1, 1, 1};
             for (int i = 0; i < nd_w; ++i) ne_w[i] = w3->ne[i];
-            ggml_tensor* wclone = ggml_new_tensor(ctx, GGML_TYPE_F32, nd_w, ne_w);
-            std::memcpy(wclone->data, w3->data, ggml_nbytes(w3));
-            // Reshape from [ne0=1, ne1=d_model, ne2=V] to [ne0=d_model, ne1=V].
-            // ggml_reshape_2d requires the tensor to be contiguous (it creates a view).
+            ggml_tensor* wclone = pk::graph_input_tensor(ctx, GGML_TYPE_F32, nd_w,
+                                      ne_w, w3->data, ggml_nbytes(w3));
             ggml_tensor* W = ggml_reshape_2d(ctx, wclone, d_model, V);
             // W: ne[0]=d_model (fastest), ne[1]=V ✓
 
             // ---- Bias: [V] ----
             ggml_tensor* bsrc = ctc_head_tensor(ml, "bias");
             assert(bsrc->type == GGML_TYPE_F32);
-            ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, V);
-            std::memcpy(b->data, bsrc->data, (size_t)V * sizeof(float));
+            int64_t b_ne[1] = {V};
+            ggml_tensor* b = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, b_ne,
+                                 bsrc->data, (size_t)V * sizeof(float));
 
             // ---- Linear: ggml_mul_mat(W, xt) ----
             // ggml_mul_mat(A, B): A[ne0(A), ne1(A)], B[ne0(B), ne1(B)]

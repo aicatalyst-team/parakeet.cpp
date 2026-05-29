@@ -1,5 +1,6 @@
 #include "relpos_attention.hpp"
 #include "ggml_graph.hpp"
+#include "backend.hpp"
 #include "ggml.h"
 #include <cassert>
 #include <cmath>
@@ -9,22 +10,15 @@
 
 namespace pk {
 
-// Clone a tensor from the loader context into the compute context, preserving
-// ne[] layout, type, and raw data (same helper pattern as subsampling.cpp).
-// Allowlisted attention linears (linear_q/k/v/out/pos.weight) may be stored f16
-// or q8_0 and are fed straight into ggml_mul_mat, which dequantizes src0 on the
-// fly; clone in the SAME type and copy raw bytes. pos_bias_u/v and every other
-// weight stay F32, for which this is identical to a plain f32 copy.
+// Weights from the loader are brought into the graph as inputs via the shared
+// pk::clone_weight (backend.cpp). Allowlisted attention linears
+// (linear_q/k/v/out/pos.weight) may be f16/q8_0 and are fed into ggml_mul_mat,
+// which dequantizes src0 on the fly (raw bytes copied through unchanged).
+// pos_bias_u/v and every other weight stay F32. A std::string-name overload
+// keeps the existing call sites (pre + suffix) unchanged.
 static ggml_tensor* clone_weight(ggml_context* ctx, const ModelLoader& ml,
                                  const std::string& name) {
-    ggml_tensor* src = ml.tensor(name);
-    assert(src && "missing tensor");
-    const int nd = ggml_n_dims(src);
-    int64_t ne[4] = {1, 1, 1, 1};
-    for (int i = 0; i < nd; ++i) ne[i] = src->ne[i];
-    ggml_tensor* dst = ggml_new_tensor(ctx, src->type, nd, ne);
-    std::memcpy(dst->data, src->data, ggml_nbytes(src));
-    return dst;
+    return pk::clone_weight(ctx, ml, name.c_str());
 }
 
 RelPosAttention::RelPosAttention(const ModelLoader& ml, int layer_idx)
@@ -64,15 +58,21 @@ void RelPosAttention::forward(const std::vector<float>& x, int T,
         (size_t)128 * 1024 * 1024 +
         (size_t)H * (size_t)T * (size_t)pos_len * 64 * sizeof(float);
 
+    // Host-built additive masks (filled inside the build lambda; kept alive for
+    // the whole call so the deferred input copies stay valid).
+    std::vector<float> mask_host, qmask_host;
+
     bool ok = pk::run_graph(mem_bytes, /*n_threads*/4,
         [&](ggml_context* ctx) -> ggml_tensor* {
             // ---- inputs ----
             // x: ne [D, T] (d_model fastest), fed time-major x[t*D + c].
-            ggml_tensor* xt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
-            std::memcpy(xt->data, x.data(), (size_t)T * D * sizeof(float));
+            int64_t xt_ne[2] = {D, T};
+            ggml_tensor* xt = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, xt_ne,
+                                  x.data(), (size_t)T * D * sizeof(float));
             // pos_emb: ne [D, P] (d_model fastest), pe[p*D + c].
-            ggml_tensor* pe = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, pos_len);
-            std::memcpy(pe->data, pos_emb.data(), (size_t)pos_len * D * sizeof(float));
+            int64_t pe_ne[2] = {D, pos_len};
+            ggml_tensor* pe = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, pe_ne,
+                                  pos_emb.data(), (size_t)pos_len * D * sizeof(float));
 
             // ---- linear projections (nn.Linear: ggml W ne=[in,out]) ----
             // The bias is added only when requested AND present: NeMo configures
@@ -149,9 +149,9 @@ void RelPosAttention::forward(const std::vector<float>& x, int T,
             const int chunk_size  = chunked_limited_ ? (att_right_ + 1) : 0;
             const int left_chunks = (chunked_limited_ && chunk_size > 0)
                                     ? (att_left_ / chunk_size) : 0;
-            ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, T);
+            mask_host.assign((size_t)T * T, 0.0f);
             {
-                float* md = (float*)mask->data;
+                float* md = mask_host.data();
                 const float ninf = -INFINITY;
                 for (int qi = 0; qi < T; ++qi) {
                     const int cq = chunked_limited_ ? (qi / chunk_size) : 0;
@@ -166,6 +166,10 @@ void RelPosAttention::forward(const std::vector<float>& x, int T,
                     }
                 }
             }
+            int64_t mask_ne[2] = {T, T};
+            ggml_tensor* mask = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2,
+                                    mask_ne, mask_host.data(),
+                                    mask_host.size() * sizeof(float));
             // softmax(scores*scale + mask), normalized over keys (ne0).
             ggml_tensor* attn = ggml_soft_max_ext(ctx, scores, mask, scale, 0.0f); // [T_k, T_q, H]
 
@@ -189,9 +193,13 @@ void RelPosAttention::forward(const std::vector<float>& x, int T,
             // linear_out.bias. The key-column mask above doesn't cover this (it only
             // zeros padded keys), so apply a query-row mask [1, T] over the context.
             if (valid_len < T) {
-                ggml_tensor* qmask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, T);
-                float* qd = (float*)qmask->data;
-                for (int qi = 0; qi < T; ++qi) qd[qi] = (qi < valid_len) ? 1.0f : 0.0f;
+                qmask_host.assign(T, 0.0f);
+                for (int qi = 0; qi < T; ++qi)
+                    qmask_host[qi] = (qi < valid_len) ? 1.0f : 0.0f;
+                int64_t qm_ne[2] = {1, T};
+                ggml_tensor* qmask = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2,
+                                         qm_ne, qmask_host.data(),
+                                         qmask_host.size() * sizeof(float));
                 merged = ggml_mul(ctx, merged, qmask); // broadcast over D
             }
 

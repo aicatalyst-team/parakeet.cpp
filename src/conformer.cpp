@@ -1,42 +1,30 @@
 #include "conformer.hpp"
 #include "relpos_attention.hpp"
 #include "ggml_graph.hpp"
+#include "backend.hpp"
 #include "ggml.h"
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace pk {
 
-// Clone a tensor from the loader context into the compute context, preserving
-// ne[] layout, type, and raw data (same helper pattern as relpos_attention.cpp).
-// Weights on the converter's quantization allowlist (the FFN/attention linears)
-// may be stored f16 or q8_0; ggml_mul_mat dequantizes those src0 weights on the
-// fly, so we clone in the SAME type and copy the raw (quantized) bytes through.
-// All other weights stay F32, for which this is identical to a plain f32 copy.
+// Weights from the loader are brought into the graph as inputs via the shared
+// pk::clone_weight / pk::clone_weight_opt (backend.cpp). Quantization-allowlist
+// linears may be f16/q8_0 (ggml_mul_mat dequantizes src0 on the fly; raw bytes
+// copied through). Optional weights (conv biases, absent in bias=False
+// checkpoints) use clone_weight_opt. std::string-name overloads keep the
+// existing call sites (pre + suffix) unchanged.
 static ggml_tensor* clone_weight(ggml_context* ctx, const ModelLoader& ml,
                                  const std::string& name) {
-    ggml_tensor* src = ml.tensor(name);
-    assert(src && "missing tensor");
-    const int nd = ggml_n_dims(src);
-    int64_t ne[4] = {1, 1, 1, 1};
-    for (int i = 0; i < nd; ++i) ne[i] = src->ne[i];
-    ggml_tensor* dst = ggml_new_tensor(ctx, src->type, nd, ne);
-    std::memcpy(dst->data, src->data, ggml_nbytes(src));
-    return dst;
+    return pk::clone_weight(ctx, ml, name.c_str());
 }
-
-// Like clone_weight but returns nullptr when the tensor is absent (optional
-// weight). The conformer conv submodule's Conv1d biases are present in some
-// checkpoints (e.g. parakeet-tdt_ctc-110m) and absent in others where NeMo
-// configures the convolutions with bias=False (e.g. parakeet-tdt-0.6b-v2/-v3).
-// Honour whatever the checkpoint actually carries instead of assuming a bias.
 static ggml_tensor* clone_weight_opt(ggml_context* ctx, const ModelLoader& ml,
                                      const std::string& name) {
-    if (!ml.tensor(name)) return nullptr;
-    return clone_weight(ctx, ml, name);
+    return pk::clone_weight_opt(ctx, ml, name.c_str());
 }
 
 // Build the ConformerConvolution sub-graph (everything AFTER norm_conv) on the
@@ -61,11 +49,16 @@ static ggml_tensor* clone_weight_opt(ggml_context* ctx, const ModelLoader& ml,
 // (vs the symmetric (K-1)/2 each side). For the causal case the input is padded
 // explicitly with ggml_pad_ext (im2col takes one padding value per axis); the
 // symmetric case keeps the existing im2col p0=(K-1)/2 path byte-identically.
+// `host_pool` keeps host-side mask/scale/shift buffers alive until the enclosing
+// Backend::compute finishes (their bytes are copied into the graph AFTER alloc,
+// so they must outlive the build lambda). Each entry is owned via unique_ptr so
+// the storage addresses stay stable as more are appended.
 static ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
                                       const std::string& pre, ggml_tensor* c,
                                       int D, int T, int K, int valid_len,
                                       const std::string& conv_norm_type,
-                                      bool conv_causal) {
+                                      bool conv_causal,
+                                      std::vector<std::unique_ptr<std::vector<float>>>& host_pool) {
     const float ln_eps = 1e-5f;
     const float bn_eps = 1e-5f;
     const int pad = (K - 1) / 2;  // symmetric padding (offline model)
@@ -89,9 +82,12 @@ static ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
     //    does not smear into valid frames. Multiply by time mask [1, T]
     //    (broadcasts over channels).
     if (valid_len < T) {
-        ggml_tensor* tmask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, T);
-        float* md = (float*)tmask->data;
+        host_pool.emplace_back(new std::vector<float>(T));
+        std::vector<float>& md = *host_pool.back();
         for (int t = 0; t < T; ++t) md[t] = (t < valid_len) ? 1.0f : 0.0f;
+        int64_t tm_ne[2] = {1, T};
+        ggml_tensor* tmask = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, tm_ne,
+                                 md.data(), md.size() * sizeof(float));
         glu = ggml_mul(ctx, glu, tmask);
     }
 
@@ -150,18 +146,24 @@ static ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
         // batch_norm (inference): y = (x-mean)/sqrt(var+eps)*g + b, per-channel.
         // Fold into constant scale/shift [C] (inference constants):
         //   scale = g / sqrt(var+eps); shift = b - mean*scale.
-        ggml_tensor* scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
-        ggml_tensor* shift = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
+        // Computed host-side from the loader running stats, fed as inputs.
+        host_pool.emplace_back(new std::vector<float>(D));
+        host_pool.emplace_back(new std::vector<float>(D));
+        std::vector<float>& sc = *host_pool[host_pool.size() - 2];
+        std::vector<float>& sh = *host_pool[host_pool.size() - 1];
         const float* g = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.weight"));
         const float* bb = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.bias"));
         const float* m = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.running_mean"));
         const float* var = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.running_var"));
-        float* sc = (float*)scale->data;
-        float* sh = (float*)shift->data;
         for (int cc = 0; cc < D; ++cc) {
             sc[cc] = g[cc] / std::sqrt(var[cc] + bn_eps);
             sh[cc] = bb[cc] - m[cc] * sc[cc];
         }
+        int64_t d_ne[1] = {D};
+        ggml_tensor* scale = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, d_ne,
+                                 sc.data(), sc.size() * sizeof(float));
+        ggml_tensor* shift = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, d_ne,
+                                 sh.data(), sh.size() * sizeof(float));
         normed = ggml_add(ctx, ggml_mul(ctx, dwt, scale), shift); // [C, T]
     }
 
@@ -264,8 +266,9 @@ void ConformerLayer::forward_with_conv(const std::vector<float>& x, int T,
     {
         bool ok = pk::run_graph(mem_bytes, /*n_threads*/4,
             [&](ggml_context* ctx) -> ggml_tensor* {
-                ggml_tensor* xt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
-                std::memcpy(xt->data, x.data(), (size_t)T * D * sizeof(float));
+                int64_t xt_ne[2] = {D, T};
+                ggml_tensor* xt = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2,
+                                      xt_ne, x.data(), (size_t)T * D * sizeof(float));
                 ggml_tensor* h = layer_norm(ctx, xt, "norm_feed_forward1");
                 h = feed_forward(ctx, h, "feed_forward1");
                 h = ggml_scale(ctx, h, 0.5f);          // fc_factor
@@ -280,8 +283,9 @@ void ConformerLayer::forward_with_conv(const std::vector<float>& x, int T,
     {
         bool ok = pk::run_graph(mem_bytes, /*n_threads*/4,
             [&](ggml_context* ctx) -> ggml_tensor* {
-                ggml_tensor* rt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
-                std::memcpy(rt->data, r.data(), (size_t)T * D * sizeof(float));
+                int64_t rt_ne[2] = {D, T};
+                ggml_tensor* rt = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2,
+                                      rt_ne, r.data(), (size_t)T * D * sizeof(float));
                 return layer_norm(ctx, rt, "norm_self_att");
             }, attn_in);
         assert(ok && "conformer norm_self_att graph failed"); (void)ok;
@@ -300,13 +304,15 @@ void ConformerLayer::forward_with_conv(const std::vector<float>& x, int T,
     // ConformerConvolution operates on [channels, time]. Our [D, T] layout
     // (D fastest) is exactly that: ne0=D=channels, ne1=T=time.
     {
+        std::vector<std::unique_ptr<std::vector<float>>> host_pool;
         bool ok = pk::run_graph(mem_bytes, /*n_threads*/4,
             [&](ggml_context* ctx) -> ggml_tensor* {
-                ggml_tensor* rt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
-                std::memcpy(rt->data, r.data(), (size_t)T * D * sizeof(float));
+                int64_t rt_ne[2] = {D, T};
+                ggml_tensor* rt = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2,
+                                      rt_ne, r.data(), (size_t)T * D * sizeof(float));
                 ggml_tensor* c = layer_norm(ctx, rt, "norm_conv"); // -> [D, T]
                 return build_conv_module(ctx, ml, pre, c, D, T, K, valid_len,
-                                         conv_norm_type_, conv_causal_);
+                                         conv_norm_type_, conv_causal_, host_pool);
             }, conv_out);
         assert(ok && "conformer conv graph failed"); (void)ok;
     }
@@ -317,8 +323,9 @@ void ConformerLayer::forward_with_conv(const std::vector<float>& x, int T,
     {
         bool ok = pk::run_graph(mem_bytes, /*n_threads*/4,
             [&](ggml_context* ctx) -> ggml_tensor* {
-                ggml_tensor* rt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
-                std::memcpy(rt->data, r.data(), (size_t)T * D * sizeof(float));
+                int64_t rt_ne[2] = {D, T};
+                ggml_tensor* rt = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2,
+                                      rt_ne, r.data(), (size_t)T * D * sizeof(float));
                 ggml_tensor* h = layer_norm(ctx, rt, "norm_feed_forward2");
                 h = feed_forward(ctx, h, "feed_forward2");
                 h = ggml_scale(ctx, h, 0.5f);
@@ -345,12 +352,14 @@ void ConformerLayer::conv_module_forward(const std::vector<float>& conv_in, int 
     // conv_in is norm_conv(residual), row-major [T, D] -> ggml [D, T]
     // (channels fastest); feed it straight into the conv sub-module (NeMo's
     // ConformerConvolution.forward, which starts AFTER norm_conv).
+    std::vector<std::unique_ptr<std::vector<float>>> host_pool;
     bool ok = pk::run_graph(mem_bytes, /*n_threads*/4,
         [&](ggml_context* ctx) -> ggml_tensor* {
-            ggml_tensor* c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
-            std::memcpy(c->data, conv_in.data(), (size_t)T * D * sizeof(float));
+            int64_t c_ne[2] = {D, T};
+            ggml_tensor* c = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, c_ne,
+                                 conv_in.data(), (size_t)T * D * sizeof(float));
             return build_conv_module(ctx, ml, pre, c, D, T, K, valid_len,
-                                     conv_norm_type_, conv_causal_);
+                                     conv_norm_type_, conv_causal_, host_pool);
         }, out);
     assert(ok && "conv_module_forward graph failed"); (void)ok;
 }

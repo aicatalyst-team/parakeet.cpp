@@ -2,33 +2,28 @@
 #include "subsampling.hpp"
 #include "pos_enc.hpp"
 #include "ggml_graph.hpp"
+#include "backend.hpp"
 #include "ggml.h"
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace pk {
 
-// Clone a tensor from the loader context into the compute context, preserving
-// ne[] layout/type/data (same helper as conformer.cpp / relpos_attention.cpp:
-// allowlisted linears may be f16/q8_0 and are dequantized by ggml_mul_mat).
+// Weights from the loader are brought into the graph as inputs via the shared
+// pk::clone_weight / pk::clone_weight_opt (backend.cpp): allowlisted linears may
+// be f16/q8_0 and are dequantized by ggml_mul_mat. std::string-name overloads
+// keep the existing call sites unchanged.
 static ggml_tensor* clone_weight(ggml_context* ctx, const ModelLoader& ml,
                                  const std::string& name) {
-    ggml_tensor* src = ml.tensor(name);
-    assert(src && "missing tensor");
-    const int nd = ggml_n_dims(src);
-    int64_t ne[4] = {1, 1, 1, 1};
-    for (int i = 0; i < nd; ++i) ne[i] = src->ne[i];
-    ggml_tensor* dst = ggml_new_tensor(ctx, src->type, nd, ne);
-    std::memcpy(dst->data, src->data, ggml_nbytes(src));
-    return dst;
+    return pk::clone_weight(ctx, ml, name.c_str());
 }
 static ggml_tensor* clone_weight_opt(ggml_context* ctx, const ModelLoader& ml,
                                      const std::string& name) {
-    if (!ml.tensor(name)) return nullptr;
-    return clone_weight(ctx, ml, name);
+    return pk::clone_weight_opt(ctx, ml, name.c_str());
 }
 
 StreamingEncoder::StreamingEncoder(const ModelLoader& ml) : ml_(ml) {
@@ -133,8 +128,9 @@ std::vector<float> StreamingEncoder::layer_step(int layer_idx,
     std::vector<float> r;
     {
         bool ok = pk::run_graph(mem_bytes, 4, [&](ggml_context* ctx) -> ggml_tensor* {
-            ggml_tensor* xt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, Tc);
-            std::memcpy(xt->data, x.data(), (size_t)Tc * D * sizeof(float));
+            int64_t xt_ne[2] = {D, Tc};
+            ggml_tensor* xt = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, xt_ne,
+                                  x.data(), (size_t)Tc * D * sizeof(float));
             ggml_tensor* h = layer_norm(ctx, xt, "norm_feed_forward1");
             h = feed_forward(ctx, h, "feed_forward1");
             h = ggml_scale(ctx, h, 0.5f);
@@ -145,8 +141,9 @@ std::vector<float> StreamingEncoder::layer_step(int layer_idx,
     std::vector<float> attn_in;
     {
         bool ok = pk::run_graph(mem_bytes, 4, [&](ggml_context* ctx) -> ggml_tensor* {
-            ggml_tensor* rt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, Tc);
-            std::memcpy(rt->data, r.data(), (size_t)Tc * D * sizeof(float));
+            int64_t rt_ne[2] = {D, Tc};
+            ggml_tensor* rt = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, rt_ne,
+                                  r.data(), (size_t)Tc * D * sizeof(float));
             return layer_norm(ctx, rt, "norm_self_att");
         }, attn_in);
         assert(ok && "stream norm_self_att graph failed"); (void)ok;
@@ -157,17 +154,24 @@ std::vector<float> StreamingEncoder::layer_step(int layer_idx,
     std::vector<float> attn_out;
     {
         const std::string ap = pre + "self_attn.";
+        // kv host buffer [D, Tk] = [cache (cache_len) ; attn_in (Tc)] assembled
+        // on the host (the deferred input copy is a single contiguous block).
+        std::vector<float> kv_host((size_t)Tk * D);
+        std::memcpy(kv_host.data(), cache_channel_[layer_idx].data(),
+                    (size_t)cache_len * D * sizeof(float));
+        std::memcpy(kv_host.data() + (size_t)cache_len * D, attn_in.data(),
+                    (size_t)Tc * D * sizeof(float));
+        std::vector<float> mask_host;  // filled below, alive for the call.
         bool ok = pk::run_graph(mem_bytes, 4, [&](ggml_context* ctx) -> ggml_tensor* {
-            // kv input [D, Tk] = [cache (cache_len) ; attn_in (Tc)] (time-major).
-            ggml_tensor* kvt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, Tk);
-            std::memcpy(kvt->data, cache_channel_[layer_idx].data(),
-                        (size_t)cache_len * D * sizeof(float));
-            std::memcpy((float*)kvt->data + (size_t)cache_len * D, attn_in.data(),
-                        (size_t)Tc * D * sizeof(float));
-            ggml_tensor* qt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, Tc);
-            std::memcpy(qt->data, attn_in.data(), (size_t)Tc * D * sizeof(float));
-            ggml_tensor* pe = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, pos_len);
-            std::memcpy(pe->data, pos_emb.data(), (size_t)pos_len * D * sizeof(float));
+            int64_t kvt_ne[2] = {D, Tk};
+            ggml_tensor* kvt = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, kvt_ne,
+                                   kv_host.data(), kv_host.size() * sizeof(float));
+            int64_t qt_ne[2] = {D, Tc};
+            ggml_tensor* qt = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, qt_ne,
+                                  attn_in.data(), (size_t)Tc * D * sizeof(float));
+            int64_t pe_ne[2] = {D, pos_len};
+            ggml_tensor* pe = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, pe_ne,
+                                  pos_emb.data(), (size_t)pos_len * D * sizeof(float));
 
             auto lin = [&](const char* w, const char* b, ggml_tensor* in) {
                 ggml_tensor* W = clone_weight(ctx, ml, ap + w);
@@ -223,9 +227,9 @@ std::vector<float> StreamingEncoder::layer_step(int layer_idx,
             const int chunk = att_right_ + 1;
             const int left_chunks = (chunk > 0) ? (att_left_ / chunk) : 0;
             const int empty_cache = cache_len - clc_len_;
-            ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Tk, Tc);
+            mask_host.assign((size_t)Tk * Tc, 0.0f);
             {
-                float* md = (float*)mask->data;
+                float* md = mask_host.data();
                 const float ninf = -INFINITY;
                 for (int qi = 0; qi < Tc; ++qi) {
                     const int gq = cache_len + qi;
@@ -241,6 +245,10 @@ std::vector<float> StreamingEncoder::layer_step(int layer_idx,
                     }
                 }
             }
+            int64_t mask_ne[2] = {Tk, Tc};
+            ggml_tensor* mask = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2,
+                                    mask_ne, mask_host.data(),
+                                    mask_host.size() * sizeof(float));
             ggml_tensor* attn = ggml_soft_max_ext(ctx, scores, mask, scale, 0.0f);
 
             ggml_tensor* vh = to_heads(v, Tk);           // [dk, Tk, H]
@@ -278,9 +286,13 @@ std::vector<float> StreamingEncoder::layer_step(int layer_idx,
     // [Tc,2Tc) = glu. run_graph flattens row-major [2Tc, D].
     std::vector<float> packed; // [2Tc, D] row-major: [conv_out(Tc) ; glu(Tc)]
     {
+        // batch_norm fold scale/shift host buffers (filled below, alive for the
+        // call). cache_time is read directly from the layer cache (alive too).
+        std::vector<float> sc_host, sh_host;
         bool ok = pk::run_graph(mem_bytes, 4, [&](ggml_context* ctx) -> ggml_tensor* {
-            ggml_tensor* rt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, Tc);
-            std::memcpy(rt->data, r.data(), (size_t)Tc * D * sizeof(float));
+            int64_t rt_ne[2] = {D, Tc};
+            ggml_tensor* rt = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, rt_ne,
+                                  r.data(), (size_t)Tc * D * sizeof(float));
             // NOTE: r already includes attn_out; norm_conv operates on that
             // residual (NeMo: residual after MHSA -> norm_conv -> conv).
             ggml_tensor* c = layer_norm(ctx, rt, "norm_conv"); // [D, Tc]
@@ -296,9 +308,10 @@ std::vector<float> StreamingEncoder::layer_step(int layer_idx,
                                 ggml_sigmoid(ctx, ggml_cont(ctx, b)))); // [D, Tc]
 
             // dw_in [D, LP+Tc] = [cache_time(LP) ; glu(Tc)].
-            ggml_tensor* cache_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, LP);
-            std::memcpy(cache_t->data, cache_time_[layer_idx].data(),
-                        (size_t)LP * D * sizeof(float));
+            int64_t cache_ne[2] = {D, LP};
+            ggml_tensor* cache_t = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2,
+                                       cache_ne, cache_time_[layer_idx].data(),
+                                       (size_t)LP * D * sizeof(float));
             ggml_tensor* dw_in = ggml_concat(ctx, cache_t, glu, /*dim=*/1); // [D, LP+Tc]
 
             ggml_tensor* glu_tc = ggml_cont(ctx, ggml_transpose(ctx, dw_in)); // [LP+Tc, D]
@@ -324,17 +337,21 @@ std::vector<float> StreamingEncoder::layer_step(int layer_idx,
                 normed = ggml_mul(ctx, normed, g);
                 normed = ggml_add(ctx, normed, bb);
             } else {
-                ggml_tensor* sc_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
-                ggml_tensor* sh_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
+                sc_host.assign(D, 0.0f);
+                sh_host.assign(D, 0.0f);
                 const float* g = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.weight"));
                 const float* bb = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.bias"));
                 const float* mm = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.running_mean"));
                 const float* var = ggml_get_data_f32(ml.tensor(pre + "conv.batch_norm.running_var"));
-                float* scd = (float*)sc_t->data; float* shd = (float*)sh_t->data;
                 for (int cc2 = 0; cc2 < D; ++cc2) {
-                    scd[cc2] = g[cc2] / std::sqrt(var[cc2] + 1e-5f);
-                    shd[cc2] = bb[cc2] - mm[cc2] * scd[cc2];
+                    sc_host[cc2] = g[cc2] / std::sqrt(var[cc2] + 1e-5f);
+                    sh_host[cc2] = bb[cc2] - mm[cc2] * sc_host[cc2];
                 }
+                int64_t d_ne[1] = {D};
+                ggml_tensor* sc_t = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1,
+                                        d_ne, sc_host.data(), sc_host.size() * sizeof(float));
+                ggml_tensor* sh_t = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1,
+                                        d_ne, sh_host.data(), sh_host.size() * sizeof(float));
                 normed = ggml_add(ctx, ggml_mul(ctx, dwt, sc_t), sh_t);
             }
             normed = ggml_silu(ctx, normed);
@@ -380,8 +397,9 @@ std::vector<float> StreamingEncoder::layer_step(int layer_idx,
     std::vector<float> out;
     {
         bool ok = pk::run_graph(mem_bytes, 4, [&](ggml_context* ctx) -> ggml_tensor* {
-            ggml_tensor* rt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, Tc);
-            std::memcpy(rt->data, r.data(), (size_t)Tc * D * sizeof(float));
+            int64_t rt_ne[2] = {D, Tc};
+            ggml_tensor* rt = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, rt_ne,
+                                  r.data(), (size_t)Tc * D * sizeof(float));
             ggml_tensor* h = layer_norm(ctx, rt, "norm_feed_forward2");
             h = feed_forward(ctx, h, "feed_forward2");
             h = ggml_scale(ctx, h, 0.5f);

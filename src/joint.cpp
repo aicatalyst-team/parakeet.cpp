@@ -1,5 +1,6 @@
 #include "joint.hpp"
 #include "ggml_graph.hpp"
+#include "backend.hpp"
 #include "ggml.h"
 #include <cassert>
 #include <cstring>
@@ -10,22 +11,13 @@ namespace pk {
 
 namespace {
 
-// Copy a weight tensor from the model loader into the compute context,
-// preserving its type and raw bytes. Supports 1-D and 2-D weights; returns a
-// contiguous ggml tensor. The joint enc/pred PROJECTION weights are on the
-// converter's quantization allowlist and may be stored f16/q8_0 -- they are fed
-// straight into ggml_mul_mat below, which dequantizes src0 on the fly. (The
+// Bring a joint weight from the loader into the graph as an input (shared
+// pk::clone_weight). The enc/pred PROJECTION weights are on the quantization
+// allowlist and may be f16/q8_0; ggml_mul_mat dequantizes src0 on the fly. (The
 // joint OUTPUT projection joint.joint_net.2.weight is read as a raw float* in
 // forward() and is intentionally kept F32 by the converter.)
 static ggml_tensor* clone_w(ggml_context* ctx, const ModelLoader& ml, const char* name) {
-    ggml_tensor* src = ml.tensor(name);
-    assert(src && "missing joint tensor");
-    const int nd = ggml_n_dims(src);
-    int64_t ne[4] = {1, 1, 1, 1};
-    for (int i = 0; i < nd; ++i) ne[i] = src->ne[i];
-    ggml_tensor* dst = ggml_new_tensor(ctx, src->type, nd, ne);
-    std::memcpy(dst->data, src->data, ggml_nbytes(src));
-    return dst;
+    return pk::clone_weight(ctx, ml, name);
 }
 
 } // namespace
@@ -61,8 +53,9 @@ void Joint::forward(const std::vector<float>& enc,  int T, int enc_hidden,
         bool ok = pk::run_graph(mem, 4,
             [&](ggml_context* ctx) -> ggml_tensor* {
                 // Input: row-major [T, E], ggml ne[0]=enc_hidden (fastest), ne[1]=T
-                ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, enc_hidden, T);
-                std::memcpy(x->data, enc.data(), (size_t)T * enc_hidden * sizeof(float));
+                int64_t x_ne[2] = {enc_hidden, T};
+                ggml_tensor* x = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, x_ne,
+                                     enc.data(), (size_t)T * enc_hidden * sizeof(float));
 
                 // Weight: ggml ne[0]=enc_hidden, ne[1]=H
                 ggml_tensor* W = clone_w(ctx, ml_, "joint.enc.weight");
@@ -86,8 +79,9 @@ void Joint::forward(const std::vector<float>& enc,  int T, int enc_hidden,
         bool ok = pk::run_graph(mem, 4,
             [&](ggml_context* ctx) -> ggml_tensor* {
                 // Input: row-major [U, P], ggml ne[0]=pred_hidden, ne[1]=U
-                ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pred_hidden, U);
-                std::memcpy(x->data, pred.data(), (size_t)U * pred_hidden * sizeof(float));
+                int64_t x_ne[2] = {pred_hidden, U};
+                ggml_tensor* x = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, x_ne,
+                                     pred.data(), (size_t)U * pred_hidden * sizeof(float));
 
                 // Weight: ggml ne[0]=pred_hidden, ne[1]=H
                 ggml_tensor* W = clone_w(ctx, ml_, "joint.pred.weight");
