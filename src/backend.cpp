@@ -9,7 +9,9 @@
 #include "ggml-cpu.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace pk {
@@ -54,9 +56,33 @@ struct Backend::Impl {
 static thread_local Backend* t_active = nullptr;
 
 Backend::Backend(int n_threads) : impl_(new Impl()) {
-    impl_->backend = ggml_backend_cpu_init();
+    // Optional override: PARAKEET_DEVICE=cpu forces the CPU backend (used to take
+    // a CPU baseline on a GPU box without rebuilding).
+    const char* force = std::getenv("PARAKEET_DEVICE");
+    const bool force_cpu = force && std::string(force) == "cpu";
+
+    if (!force_cpu) {
+        // Pick the first GPU device the registry reports. Whatever backend was
+        // compiled in (CUDA/Metal/Vulkan/HIP/SYCL) registers itself here, so this
+        // single path covers them all with no backend-specific includes.
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                impl_->backend = ggml_backend_dev_init(dev, nullptr);
+                if (impl_->backend) {
+                    device_name_ = ggml_backend_dev_name(dev);
+                    PK_LOG("pk::Backend using GPU device: %s", device_name_.c_str());
+                    break;
+                }
+            }
+        }
+    }
+    if (!impl_->backend) {              // CPU fallback (or CPU-only build)
+        impl_->backend = ggml_backend_cpu_init();
+        device_name_ = "cpu";
+    }
     if (!impl_->backend) {
-        PK_LOG("ggml_backend_cpu_init returned null");
+        PK_LOG("backend init returned null");
         return;
     }
     set_n_threads(n_threads);
@@ -76,7 +102,7 @@ Backend::~Backend() {
 
 void Backend::set_n_threads(int n_threads) {
     n_threads_ = n_threads > 0 ? n_threads : 1;
-    if (impl_ && impl_->backend) {
+    if (impl_ && impl_->backend && ggml_backend_is_cpu(impl_->backend)) {
         ggml_backend_cpu_set_n_threads(impl_->backend, n_threads_);
     }
 }

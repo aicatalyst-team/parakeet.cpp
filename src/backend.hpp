@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <functional>
+#include <string>
 #include <vector>
 
 struct ggml_context;
@@ -50,6 +51,10 @@ public:
     void set_n_threads(int n_threads);
     int  n_threads() const { return n_threads_; }
 
+    // Name of the selected compute device ("cpu" for the CPU backend, or the
+    // registry device name for a GPU backend, e.g. the CUDA device name).
+    const char* device_name() const { return device_name_.c_str(); }
+
     // The underlying CPU ggml backend. Exposed so the loader can give its weight
     // tensors a backend buffer over the SAME backend graphs run on (see
     // ModelLoader::realize_weights). Any CPU buffer is compatible with the CPU
@@ -89,6 +94,7 @@ private:
     struct Impl;
     Impl* impl_;
     int   n_threads_ = 1;
+    std::string device_name_ = "cpu";
 };
 
 // Register a host-backed graph input for the currently-active Backend::compute

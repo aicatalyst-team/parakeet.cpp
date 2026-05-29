@@ -13,12 +13,12 @@ option(PARAKEET_SHARED      "Build libparakeet as shared" OFF)
 option(PARAKEET_GGML_CUDA   "Forward GGML_CUDA" OFF)
 option(PARAKEET_GGML_METAL  "Forward GGML_METAL" OFF)
 option(PARAKEET_GGML_VULKAN "Forward GGML_VULKAN" OFF)
-option(PARAKEET_GGML_HIPBLAS "Forward GGML_HIPBLAS" OFF)
+option(PARAKEET_GGML_HIP "Forward GGML_HIP (ROCm)" OFF)
 
 set(GGML_CUDA    ${PARAKEET_GGML_CUDA}   CACHE BOOL "" FORCE)
 set(GGML_METAL   ${PARAKEET_GGML_METAL}  CACHE BOOL "" FORCE)
 set(GGML_VULKAN  ${PARAKEET_GGML_VULKAN} CACHE BOOL "" FORCE)
-set(GGML_HIPBLAS ${PARAKEET_GGML_HIPBLAS} CACHE BOOL "" FORCE)
+set(GGML_HIP ${PARAKEET_GGML_HIP} CACHE BOOL "" FORCE)
 
 # Performance: -march=native (GGML_NATIVE) and tinyBLAS SGEMM (GGML_LLAMAFILE)
 # give meaningful free speedups (~30% and ~25% per the rt-detr.cpp benchmarks).
