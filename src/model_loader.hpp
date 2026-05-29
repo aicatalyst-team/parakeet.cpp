@@ -75,7 +75,10 @@ private:
     ParakeetConfig cfg_;
     gguf_context* gguf_ = nullptr;
     ggml_context* ctx_ = nullptr;
-    ggml_backend_buffer_t weights_buf_ = nullptr;  // wraps ctx_ mem_buffer (zero-copy)
+    // CPU backend: wraps ctx_ mem_buffer (zero-copy). Device backend: owns the
+    // device buffer holding the uploaded weights (mirrored into device_ctx_).
+    ggml_backend_buffer_t weights_buf_ = nullptr;
+    ggml_context* device_ctx_ = nullptr;  // no_alloc mirror ctx for device weights
     std::unordered_map<std::string, ggml_tensor*> tensors_;
 };
 }

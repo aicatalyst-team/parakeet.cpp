@@ -35,10 +35,13 @@ static std::string kv_str(gguf_context* g, const char* k, const char* d=""){
     int64_t id = gguf_find_key(g,k); return id<0 ? std::string(d) : std::string(gguf_get_val_str(g,id));
 }
 ModelLoader::~ModelLoader(){
-    // Free the weight buffer BEFORE the ctx. It is a from_ptr buffer (free_buffer
-    // == NULL), so it does NOT own the underlying memory — the ctx mem_buffer
-    // does. Freeing it just releases the small buffer wrapper object.
+    // Free the weight buffer BEFORE the ctxs. For the CPU path it is a from_ptr
+    // buffer (free_buffer == NULL) that does NOT own its memory (ctx_ does); for
+    // the device path it OWNS the device buffer. ggml_backend_buffer_free handles
+    // both. device_ctx_ holds the device tensor metadata (no_alloc); ctx_ holds
+    // the host source data.
     if(weights_buf_) ggml_backend_buffer_free(weights_buf_);
+    if(device_ctx_) ggml_free(device_ctx_);
     if(gguf_) gguf_free(gguf_); if(ctx_) ggml_free(ctx_);
 }
 bool ModelLoader::realize_weights(ggml_backend_t backend){
@@ -62,17 +65,35 @@ bool ModelLoader::realize_weights(ggml_backend_t backend){
         return true;
     }
 
-    // Device path (e.g. CUDA/Metal/Vulkan): snapshot the host data pointers, then
-    // allocate all ctx tensors on the backend (this reassigns each ->data to a
-    // device pointer and sets ->buffer), then upload the bytes from the host
-    // snapshot. The host source remains valid in the ctx mem buffer during upload.
-    std::vector<std::pair<ggml_tensor*, const void*>> host_src;
-    for (ggml_tensor* t = ggml_get_first_tensor(ctx_); t; t = ggml_get_next_tensor(ctx_, t))
-        host_src.emplace_back(t, t->data);
-    weights_buf_ = ggml_backend_alloc_ctx_tensors(ctx_, backend);
+    // Device path (CUDA/Metal/Vulkan/...): weights must live in a backend buffer.
+    // ctx_ was created no_alloc=false (host-resident data), which
+    // ggml_backend_alloc_ctx_tensors rejects (it asserts the ctx is no_alloc).
+    // So mirror every weight into a no_alloc=true ctx, allocate THAT on the
+    // backend, upload each tensor's bytes from the host source, and repoint the
+    // name->tensor map at the device tensors. ctx_ stays alive as the host source.
+    const size_t n = tensors_.size();
+    struct ggml_init_params dp = {
+        /*.mem_size  =*/ ggml_tensor_overhead() * (n + 8),
+        /*.mem_buffer=*/ nullptr,
+        /*.no_alloc  =*/ true,
+    };
+    device_ctx_ = ggml_init(dp);
+    if(!device_ctx_){ PK_LOG("realize_weights: device ctx init failed"); return false; }
+
+    std::vector<std::pair<ggml_tensor*, const void*>> ups; ups.reserve(n);
+    std::unordered_map<std::string, ggml_tensor*> devmap; devmap.reserve(n);
+    for (auto& kv : tensors_) {
+        ggml_tensor* s = kv.second;
+        ggml_tensor* d = ggml_new_tensor(device_ctx_, s->type, GGML_MAX_DIMS, s->ne);
+        ggml_set_name(d, kv.first.c_str());
+        devmap.emplace(kv.first, d);
+        ups.emplace_back(d, s->data);   // host source (valid in ctx_ mem buffer)
+    }
+    weights_buf_ = ggml_backend_alloc_ctx_tensors(device_ctx_, backend);
     if(!weights_buf_){ PK_LOG("realize_weights: alloc_ctx_tensors failed"); return false; }
-    for (auto& pr : host_src)
+    for (auto& pr : ups)
         ggml_backend_tensor_set(pr.first, pr.second, 0, ggml_nbytes(pr.first));
+    tensors_.swap(devmap);   // graphs now reference the device-resident tensors
     return true;
 }
 bool ModelLoader::load(const std::string& path){
