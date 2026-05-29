@@ -25,6 +25,14 @@ struct PendingInput {
     const void*  host;
     size_t       nbytes;
 };
+// Extra graph tensors to read back after compute (besides the final output).
+// Used by the fused encoder's forward_capture to pull per-layer outputs out of
+// the SAME single graph (vs computing each layer in its own graph). `dst` is the
+// caller's vector, alive across the compute call.
+struct PendingCapture {
+    ggml_tensor*        tensor;
+    std::vector<float>* dst;
+};
 } // namespace
 
 struct Backend::Impl {
@@ -34,6 +42,8 @@ struct Backend::Impl {
     // into the gallocr-allocated tensors after ggml_gallocr_alloc_graph, then
     // cleared. Never overlaps across calls (compute is not re-entrant).
     std::vector<PendingInput> pending;
+    // Extra tensors to read back after compute (registered via capture_output).
+    std::vector<PendingCapture> captures;
 };
 
 // Thread-local pointer to the Backend whose compute() build lambda is currently
@@ -79,6 +89,10 @@ void Backend::register_input(ggml_tensor* t, const void* host, size_t nbytes) {
     impl_->pending.push_back({t, host, nbytes});
 }
 
+void Backend::register_capture(ggml_tensor* t, std::vector<float>* dst) {
+    impl_->captures.push_back({t, dst});
+}
+
 bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
                       std::vector<float>& out) {
     if (!impl_ || !impl_->backend) {
@@ -100,8 +114,10 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
         return false;
     }
 
-    // Drive add_graph_input() registrations to this Backend for the build call.
+    // Drive add_graph_input()/capture registrations to this Backend for the
+    // build call.
     impl_->pending.clear();
+    impl_->captures.clear();
     Backend* prev_active = t_active;
     t_active = this;
     struct ggml_tensor* output = build(ctx);
@@ -110,14 +126,20 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
     if (!output) {
         PK_LOG("Backend::compute: build() returned null output tensor");
         impl_->pending.clear();
+        impl_->captures.clear();
         ggml_free(ctx);
         return false;
     }
-    // Mark the output so the gallocr does not recycle its storage before we read
-    // it back, then expand the forward graph.
+    // Mark the output (and any captured tensors) so the gallocr does not recycle
+    // their storage before we read them back, then expand the forward graph.
     ggml_set_output(output);
+    for (const PendingCapture& pc : impl_->captures) ggml_set_output(pc.tensor);
 
     struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, kGraphSize, false);
+    // Expand captures FIRST so they are present in the graph even if the final
+    // output's subgraph does not reach them (it does here, but be robust).
+    for (const PendingCapture& pc : impl_->captures)
+        ggml_build_forward_expand(gf, pc.tensor);
     ggml_build_forward_expand(gf, output);
 
     // Lazily create the persistent gallocr (reused on every subsequent call; it
@@ -129,6 +151,7 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
         if (!impl_->galloc) {
             PK_LOG("Backend::compute: ggml_gallocr_new failed");
             impl_->pending.clear();
+            impl_->captures.clear();
             ggml_free(ctx);
             return false;
         }
@@ -136,6 +159,7 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
     if (!ggml_gallocr_alloc_graph(impl_->galloc, gf)) {
         PK_LOG("Backend::compute: ggml_gallocr_alloc_graph failed");
         impl_->pending.clear();
+        impl_->captures.clear();
         ggml_free(ctx);
         return false;
     }
@@ -150,9 +174,19 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
     if (status != GGML_STATUS_SUCCESS) {
         PK_LOG("Backend::compute: ggml_backend_graph_compute failed (status=%d)",
                (int)status);
+        impl_->captures.clear();
         ggml_free(ctx);
         return false;
     }
+
+    // Read back any captured intermediates (per-layer outputs), then the final
+    // output.
+    for (const PendingCapture& pc : impl_->captures) {
+        size_t cn = (size_t)ggml_nelements(pc.tensor);
+        pc.dst->resize(cn);
+        ggml_backend_tensor_get(pc.tensor, pc.dst->data(), 0, cn * sizeof(float));
+    }
+    impl_->captures.clear();
 
     size_t n = (size_t)ggml_nelements(output);
     out.resize(n);
@@ -175,6 +209,12 @@ ggml_tensor* graph_input_tensor(ggml_context* ctx, int type, int n_dims,
     ggml_tensor* t = ggml_new_tensor(ctx, (ggml_type)type, n_dims, ne);
     add_graph_input(t, host, nbytes);
     return t;
+}
+
+void capture_graph_output(ggml_tensor* t, std::vector<float>* dst) {
+    GGML_ASSERT(t_active != nullptr &&
+                "capture_graph_output called outside a Backend::compute build lambda");
+    t_active->register_capture(t, dst);
 }
 
 void ensure_weights_realized(const ModelLoader& ml) {

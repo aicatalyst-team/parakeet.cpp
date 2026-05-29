@@ -1,7 +1,12 @@
 #pragma once
 #include "model_loader.hpp"
+#include "graph_builder.hpp"
 #include <string>
 #include <vector>
+
+struct ggml_context;
+struct ggml_tensor;
+
 namespace pk {
 
 // A single FastConformer encoder layer (NeMo ConformerLayer), built per-layer
@@ -40,6 +45,19 @@ namespace pk {
 class ConformerLayer {
 public:
     ConformerLayer(const ModelLoader& ml, int layer_idx);
+
+    // GRAPH-BUILDER: append the WHOLE conformer layer (FFN1 + MHSA + conv + FFN2
+    // + norm_out) to a SHARED graph `ctx`. `xt` is the layer input tensor [D, T]
+    // and `pe` is the positional-encoding tensor [D, pos_len], both ALREADY in
+    // the graph. Returns the layer output [D, T] (ggml ne0=D fastest, row-major
+    // [T, d_model]). Host-built masks / batch-norm fold constants are fed via
+    // pk::graph_input_tensor and registered into `pool` (must outlive compute).
+    // This is the unit reused by the fused encoder AND the unit test; computing
+    // the entire layer as ONE sub-graph (vs the old 5 sub-graphs) is what lets
+    // the fused encoder be a single graph.
+    ggml_tensor* build_graph(ggml_context* ctx, ggml_tensor* xt, int T,
+                             ggml_tensor* pe, int pos_len, int valid_len,
+                             GraphInputPool& pool) const;
 
     // x: [T, d_model]; pos_emb: [pos_len=2T-1, d_model]; out: [T, d_model].
     void forward(const std::vector<float>& x, int T,

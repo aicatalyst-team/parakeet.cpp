@@ -2,6 +2,10 @@
 #include "subsampling.hpp"
 #include "conformer.hpp"
 #include "pos_enc.hpp"
+#include "ggml_graph.hpp"
+#include "backend.hpp"
+#include "graph_builder.hpp"
+#include "ggml.h"
 #include <cassert>
 #include <cmath>
 #include <vector>
@@ -27,44 +31,66 @@ void Encoder::forward_capture(const std::vector<float>& mel, int n_mels, int T,
                               std::vector<float>& enc_out, int& d_model, int& Tout,
                               const std::vector<int>& capture_layers,
                               std::vector<std::vector<float>>& layer_outs) const {
-    // ---- 1. Subsampling: mel [n_mels,T] -> x [T', d_model], plus valid_len. ----
-    Subsampling sub(ml_);
-    std::vector<float> x;        // row-major [T', d_model]
-    int Tp = 0, dm = 0, valid_len = 0;
-    sub.forward(mel, n_mels, T, x, Tp, dm, valid_len);
-    assert(dm == d_model_);
-
-    // ---- 2. xscaling (gated; off for this model). NeMo scales x, not pos_emb. ----
-    if (xscaling_) {
-        const float xscale = std::sqrt((float)d_model_);
-        for (float& v : x) v *= xscale;
-    }
-
-    // ---- 3. Relative positional encoding pos_emb [2T'-1, d_model]. ----
-    std::vector<float> pos_emb;
-    rel_pos_encoding(Tp, d_model_, pos_emb);
-    const int pos_len = 2 * Tp - 1;
-
-    // ---- 4. Conformer layer stack. Each layer: [T',d_model] -> [T',d_model]. ----
+    // The WHOLE encoder is ONE ggml graph: subsampling -> xscaling -> N conformer
+    // layers (each FFN1+attn+conv+FFN2+norm_out in-graph) -> final transpose,
+    // computed in a SINGLE Backend::compute. (Mel stays plain C++, transposed and
+    // fed as the input inside the subsampling builder.) Versus the old ~85
+    // per-utterance graphs, this lets the CPU threadpool parallelise across the
+    // entire encoder. The per-component graph-BUILDERS (Subsampling/RelPos/
+    // ConformerLayer::build_graph) are reused verbatim by the unit tests.
     layer_outs.assign(capture_layers.size(), {});
-    std::vector<float> next;
-    for (int i = 0; i < n_layers_; ++i) {
-        ConformerLayer layer(ml_, i);
-        layer.forward(x, Tp, pos_emb, pos_len, valid_len, next);
-        x.swap(next);
-        for (size_t c = 0; c < capture_layers.size(); ++c) {
-            if (capture_layers[c] == i) layer_outs[c] = x;  // copy [T', d_model]
-        }
-    }
 
-    // ---- 5. Final transpose [T', d_model] -> [d_model, T'] (channels-first). ----
-    // x is row-major [T', d_model] (x[t*d_model + c]); produce enc_out[c*T' + t].
-    enc_out.assign((size_t)d_model_ * Tp, 0.0f);
-    for (int t = 0; t < Tp; ++t)
-        for (int c = 0; c < d_model_; ++c)
-            enc_out[(size_t)c * Tp + t] = x[(size_t)t * d_model_ + c];
+    // Pos_emb is computed host-side once T' is known (deterministic from T, but
+    // we read it from the subsampling builder). Storage lives in the pool so it
+    // outlives Backend::compute. capture_layers map: layer idx -> output slot.
+    GraphInputPool pool;
+    Subsampling sub(ml_);
+    int Tp = 0, valid_len = 0, dm_out = 0;
 
-    d_model = d_model_;
+    bool ok = pk::run_graph(/*mem_bytes*/0, /*n_threads*/0,
+        [&](ggml_context* ctx) -> ggml_tensor* {
+            // ---- 1. Subsampling: mel [n_mels,T] -> x [d_model, T'] (+ valid). ----
+            ggml_tensor* x = sub.build_graph(ctx, mel, n_mels, T, pool, Tp,
+                                             valid_len);
+            dm_out = d_model_;
+            assert((int)x->ne[0] == d_model_);
+
+            // ---- 2. xscaling (gated; off for this model). NeMo scales x. ----
+            if (xscaling_) {
+                x = ggml_scale(ctx, x, std::sqrt((float)d_model_));
+            }
+
+            // ---- 3. Relative positional encoding pos_emb [d_model, 2T'-1]. ----
+            const int pos_len = 2 * Tp - 1;
+            std::vector<float>& pe_host = pool.alloc_f32();
+            rel_pos_encoding(Tp, d_model_, pe_host); // row-major [pos_len, d_model]
+            int64_t pe_ne[2] = {d_model_, pos_len};
+            ggml_tensor* pe = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, pe_ne,
+                                  pe_host.data(), pe_host.size() * sizeof(float));
+
+            // ---- 4. Conformer layer stack (all in-graph). ----
+            for (int i = 0; i < n_layers_; ++i) {
+                ConformerLayer layer(ml_, i);
+                x = layer.build_graph(ctx, x, Tp, pe, pos_len, valid_len, pool);
+                // Capture requested layer outputs from the SAME graph (row-major
+                // [T', d_model], matching the layer output orientation).
+                for (size_t c = 0; c < capture_layers.size(); ++c) {
+                    if (capture_layers[c] == i)
+                        pk::capture_graph_output(x, &layer_outs[c]);
+                }
+            }
+
+            // ---- 5. Final transpose [d_model, T'] -> [T', d_model] (channels-
+            //         first): ggml transpose+cont gives ne0=T', ne1=d_model ->
+            //         row-major [d_model, T'] = enc_out[c*T' + t]. ----
+            x = ggml_cont(ctx, ggml_transpose(ctx, x));
+            return x; // ne [T', d_model] -> row-major [d_model, T']
+        }, enc_out);
+
+    assert(ok && "encoder graph failed");
+    (void)ok;
+
+    d_model = dm_out;
     Tout = Tp;
 }
 

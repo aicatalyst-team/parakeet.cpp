@@ -79,6 +79,12 @@ public:
     // free helper can reach it, but callers should use add_graph_input().
     void register_input(ggml_tensor* t, const void* host, size_t nbytes);
 
+    // Backend-internal hook used by capture_graph_output(). Marks `t` as an
+    // output kept by the gallocr and reads its f32 contents into `*dst` after
+    // compute. Lets one graph yield several tensors (e.g. the fused encoder's
+    // per-layer captures) without separate compute calls.
+    void register_capture(ggml_tensor* t, std::vector<float>* dst);
+
 private:
     struct Impl;
     Impl* impl_;
@@ -103,6 +109,13 @@ void add_graph_input(ggml_tensor* t, const void* host, size_t nbytes);
 ggml_tensor* graph_input_tensor(ggml_context* ctx, int type, int n_dims,
                                 const int64_t* ne, const void* host,
                                 size_t nbytes);
+
+// Capture an intermediate graph tensor for readback after Backend::compute.
+// `*dst` is resized to the tensor's element count and filled with its f32
+// contents once the graph has run. Must be called from inside a build lambda;
+// `dst` must stay valid until Backend::compute returns. Used by the fused
+// encoder to pull per-layer outputs out of the single graph.
+void capture_graph_output(ggml_tensor* t, std::vector<float>* dst);
 
 // Reference a weight tensor from the loader DIRECTLY as a graph leaf (ZERO
 // per-call copy). The loader gives every weight a CPU backend buffer ONCE at

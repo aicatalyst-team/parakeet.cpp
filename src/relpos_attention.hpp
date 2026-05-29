@@ -1,6 +1,11 @@
 #pragma once
 #include "model_loader.hpp"
+#include "graph_builder.hpp"
 #include <vector>
+
+struct ggml_context;
+struct ggml_tensor;
+
 namespace pk {
 
 // Relative-position multi-head self-attention (Transformer-XL style) as used by
@@ -25,6 +30,17 @@ namespace pk {
 class RelPosAttention {
 public:
     RelPosAttention(const ModelLoader& ml, int layer_idx);
+
+    // GRAPH-BUILDER: append MHSA ops to a SHARED graph `ctx`. `xt` is the
+    // normalized attention input tensor [D, T] (ggml ne0=D fastest) and `pe` is
+    // the positional-encoding tensor [D, pos_len], both ALREADY in the graph.
+    // Returns the attention output [D, T]. Host-built additive masks are fed via
+    // pk::graph_input_tensor and registered into `pool` (must outlive compute).
+    // Reused by the fused conformer layer and the unit test.
+    ggml_tensor* build_graph(ggml_context* ctx, ggml_tensor* xt, int T,
+                             ggml_tensor* pe, int pos_len, int valid_len,
+                             GraphInputPool& pool) const;
+
     // x: [T, d_model]; pos_emb: [2T-1, d_model]; out: [T, d_model].
     void forward(const std::vector<float>& x, int T,
                  const std::vector<float>& pos_emb, int pos_len,

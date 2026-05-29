@@ -1,6 +1,11 @@
 #pragma once
 #include "model_loader.hpp"
+#include "graph_builder.hpp"
 #include <vector>
+
+struct ggml_context;
+struct ggml_tensor;
+
 namespace pk {
 
 // dw_striding (÷8) convolutional subsampling front end of the FastConformer
@@ -8,6 +13,20 @@ namespace pk {
 class Subsampling {
 public:
     explicit Subsampling(const ModelLoader& ml);
+
+    // GRAPH-BUILDER: append the subsampling ops to a SHARED graph `ctx` and
+    // return the output tensor [d_model, T'] (ggml ne0=d_model fastest, i.e.
+    // row-major [T', d_model]). `mel` is the host mel [n_mels, T] (feat-major
+    // inner = T, mel[m*T+t]); it is transposed host-side into `pool`-owned
+    // storage and fed as a graph input, so it must outlive the enclosing
+    // Backend::compute. `out_Tp`/`out_valid` receive the subsampled time length
+    // and valid (non-pad) frame count. Reused by both the fused encoder and the
+    // unit test. Uses pk::clone_weight (zero-copy weights) + pk::graph_input_*
+    // for host-built masks (registered into `pool` for lifetime).
+    ggml_tensor* build_graph(ggml_context* ctx, const std::vector<float>& mel,
+                             int n_mels, int T, GraphInputPool& pool,
+                             int& out_Tp, int& out_valid,
+                             int in_valid_frames = -1) const;
     // mel: row-major [n_mels, T] (feat-major inner = T) — i.e. mel[m*T + t].
     // out: row-major [Tout, d_model] (time-major) matching baseline subsampling_out.
     void forward(const std::vector<float>& mel, int n_mels, int T,
