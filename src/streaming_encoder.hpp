@@ -91,14 +91,6 @@ private:
     std::vector<std::vector<float>> cache_time_;
     // cache_last_channel[layer]: row-major [last_channel_cache, d_model]
     std::vector<std::vector<float>> cache_channel_;
-
-    // Run one conformer layer in streaming mode (with caches). `x` is the chunk's
-    // [Tc, d_model] row-major input; pos_emb is [2*P-1, d_model] for P=Tc+cache.
-    // Updates this layer's conv + attention caches in place and returns the
-    // layer output [Tc, d_model].
-    std::vector<float> layer_step(int layer_idx, const std::vector<float>& x,
-                                  int Tc, const std::vector<float>& pos_emb,
-                                  int pos_len, int cache_len);
 };
 
 } // namespace pk

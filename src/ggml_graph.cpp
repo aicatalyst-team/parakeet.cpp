@@ -68,10 +68,21 @@ int g_backend_threads = 0;
 std::mutex g_backend_mutex;
 } // namespace
 
+// Default ggml compute-thread count when --threads is unset. On this class of
+// many-core desktop CPUs (e.g. the 20-core box this was tuned on, and rf-detr's
+// dual-CCD finding) using ALL cores REGRESSES throughput: a single-CCD-sized
+// count parallelises the now-fused encoder graph while avoiding cross-CCD cache
+// traffic and threadpool contention. Sweep on the fused 110m offline path
+// (LibriSpeech): t=1 25.6, t=2 41.6, t=4 60.9, t=8 75.4, t=16 70.9, t=20 43.4
+// RTFx -> 8 is the clear winner (+24% over 16, +74% over 20, +24% over the old
+// default of 4). The unit tests pass an explicit per-call n_threads (4) and so
+// are unaffected by this default.
+constexpr int kDefaultThreads = 8;
+
 Backend& global_backend() {
     std::call_once(g_backend_once, [] {
         const int g = g_num_threads.load(std::memory_order_relaxed);
-        const int n = g > 0 ? g : 4;  // 4 matches the historical per-call default
+        const int n = g > 0 ? g : kDefaultThreads;
         g_backend = std::make_unique<Backend>(n);
         g_backend_threads = n;
     });

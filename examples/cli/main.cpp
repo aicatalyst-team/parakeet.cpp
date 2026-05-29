@@ -94,6 +94,11 @@ static int cmd_transcribe_stream(const std::string& model, const std::string& in
         std::vector<pk::Word> all_words;  // collected for the --timestamps recap
         std::printf("[stream] ");
         std::fflush(stdout);
+        // Optional streaming-proc timer (PARAKEET_STREAM_PROFILE=1): times ONLY the
+        // chunk loop + finalize (model already loaded), so the streaming-specific
+        // fusion win can be measured without the one-time load cost.
+        const bool stream_prof = std::getenv("PARAKEET_STREAM_PROFILE") != nullptr;
+        auto sp_t0 = std::chrono::steady_clock::now();
         pk::run_stream_over_pcm(
             sess, ml, audio.samples,
             [&](const std::string& new_text, const std::vector<pk::EouEvent>& evs,
@@ -112,6 +117,14 @@ static int cmd_transcribe_stream(const std::string& model, const std::string& in
         // Flush the end-of-stream tail (no extra <EOU> is fabricated if NeMo's
         // streaming would not emit one for this clip).
         std::string tail = sess.finalize();
+        if (stream_prof) {
+            double sp_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - sp_t0).count();
+            double audio_sec = (double)audio.samples.size() / 16000.0;
+            std::fprintf(stderr,
+                "[stream-profile] audio=%.2fs proc=%.1fms RTFx=%.2f\n",
+                audio_sec, sp_ms, (sp_ms > 0.0) ? (audio_sec * 1000.0 / sp_ms) : 0.0);
+        }
         if (!tail.empty()) std::printf("%s", tail.c_str());
         if (timestamps) {
             // The trailing open word finalizes only at finalize(); drain it now.
@@ -143,6 +156,7 @@ static int cmd_transcribe(int argc, char** argv) {
     bool stream = false;
     bool timestamps = false;
     bool json = false;
+    int threads = 0;  // 0 == unset -> use the persistent-backend default
     for (int i = 0; i < argc; ++i) {
         if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             model = argv[++i];
@@ -154,6 +168,8 @@ static int cmd_transcribe(int argc, char** argv) {
             stream = true;
         } else if (std::strcmp(argv[i], "--timestamps") == 0) {
             timestamps = true;
+        } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            threads = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--json") == 0) {
             json = true;
         }
@@ -161,9 +177,12 @@ static int cmd_transcribe(int argc, char** argv) {
     if (model.empty() || input.empty()) {
         std::fprintf(stderr,
             "usage: parakeet-cli transcribe --model <m.gguf> --input <wav> "
-            "[--decoder ctc|tdt] [--stream] [--timestamps] [--json]\n");
+            "[--decoder ctc|tdt] [--stream] [--timestamps] [--threads N] [--json]\n");
         return 2;
     }
+    // Apply the thread override (offline + streaming graph compute). When unset
+    // the persistent-backend default (kDefaultThreads) is used.
+    if (threads > 0) pk::set_num_threads(threads);
 
     if (stream) {
         if (!decoder_str.empty()) {
@@ -522,7 +541,7 @@ static int cmd_bench(int argc, char** argv) {
     if (threads > 0) {
         pk::set_num_threads(threads);
     } else {
-        reported_threads = 4;  // the per-call default the components pass
+        reported_threads = 8;  // the persistent-backend default (kDefaultThreads)
     }
 
     bool man_ok = false;
@@ -632,7 +651,7 @@ int main(int argc, char** argv) {
         "usage:\n"
         "  parakeet-cli info <model.gguf>\n"
         "  parakeet-cli transcribe --model <model.gguf> --input <wav> "
-        "[--decoder ctc|tdt] [--stream] [--timestamps] [--json]\n"
+        "[--decoder ctc|tdt] [--stream] [--timestamps] [--threads N] [--json]\n"
         "  parakeet-cli quantize <in.gguf> <out.gguf> "
         "<q4_0|q5_0|q8_0|q4_k|q5_k|q6_k>\n"
         "  parakeet-cli bench --model <model.gguf> --manifest <file> "
