@@ -12,6 +12,7 @@
 #include "rnnt.hpp"
 #include "transcription.hpp"
 #include "decode_types.hpp"
+#include "backend.hpp"
 
 #include <stdexcept>
 #include <vector>
@@ -37,6 +38,10 @@ std::unique_ptr<Model> Model::load(const std::string& gguf_path) {
     if (!m->loader_.load(gguf_path)) {
         return nullptr;
     }
+    // Give the weights a CPU backend buffer ONCE so graphs reference them
+    // directly as leaves (zero per-call copy). Done at load (vs. lazily on first
+    // clone_weight) so the cost is paid up front, not per utterance.
+    ensure_weights_realized(m->loader_);
     return m;
 }
 

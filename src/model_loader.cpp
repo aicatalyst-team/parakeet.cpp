@@ -1,6 +1,7 @@
 #include "model_loader.hpp"
 #include "common.hpp"
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 #include <cstring>
 namespace pk {
@@ -29,7 +30,30 @@ static bool kv_bool(gguf_context* g, const char* k, bool d=false){
 static std::string kv_str(gguf_context* g, const char* k, const char* d=""){
     int64_t id = gguf_find_key(g,k); return id<0 ? std::string(d) : std::string(gguf_get_val_str(g,id));
 }
-ModelLoader::~ModelLoader(){ if(gguf_) gguf_free(gguf_); if(ctx_) ggml_free(ctx_); }
+ModelLoader::~ModelLoader(){
+    // Free the weight buffer BEFORE the ctx. It is a from_ptr buffer (free_buffer
+    // == NULL), so it does NOT own the underlying memory — the ctx mem_buffer
+    // does. Freeing it just releases the small buffer wrapper object.
+    if(weights_buf_) ggml_backend_buffer_free(weights_buf_);
+    if(gguf_) gguf_free(gguf_); if(ctx_) ggml_free(ctx_);
+}
+bool ModelLoader::realize_weights(ggml_backend_t backend){
+    if(weights_buf_) return true;           // idempotent
+    if(!backend || !ctx_){ PK_LOG("realize_weights: null backend/ctx"); return false; }
+    // The GGUF is loaded with no_alloc=false, so every tensor's data lives in
+    // one contiguous ctx mem_buffer. Wrap that exact memory as a CPU backend
+    // buffer (zero-copy: ggml_backend_cpu_buffer_from_ptr borrows the ptr) and
+    // point every tensor's ->buffer at it, so graphs can reference the loader
+    // tensors DIRECTLY as leaves (the gallocr treats data!=NULL tensors as
+    // already-allocated and never copies them; reshapes/views resolve at build
+    // time). This eliminates the per-call weight recopy.
+    void*  base = ggml_get_mem_buffer(ctx_);
+    size_t size = ggml_get_mem_size(ctx_);
+    weights_buf_ = ggml_backend_cpu_buffer_from_ptr(base, size);
+    if(!weights_buf_){ PK_LOG("realize_weights: buffer_from_ptr failed"); return false; }
+    for(auto& kv : tensors_) kv.second->buffer = weights_buf_;
+    return true;
+}
 bool ModelLoader::load(const std::string& path){
     struct gguf_init_params p{ /*no_alloc*/false, /*ctx*/&ctx_ };
     gguf_ = gguf_init_from_file(path.c_str(), p);

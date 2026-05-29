@@ -33,4 +33,10 @@ bool run_graph(size_t mem_bytes, int n_threads,
 void set_num_threads(int n);
 int  num_threads();  // current override (0 == unset)
 
+class Backend;
+// The process-global persistent Backend (created lazily on first use). Exposed
+// so the weight-realization path can give the loader's tensors a backend buffer
+// on the SAME CPU backend that graphs run on.
+Backend& global_backend();
+
 } // namespace pk

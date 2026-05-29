@@ -1,5 +1,6 @@
 #include "backend.hpp"
 #include "common.hpp"
+#include "ggml_graph.hpp"   // pk::global_backend()
 #include "model_loader.hpp"
 
 #include "ggml.h"
@@ -68,6 +69,10 @@ void Backend::set_n_threads(int n_threads) {
     if (impl_ && impl_->backend) {
         ggml_backend_cpu_set_n_threads(impl_->backend, n_threads_);
     }
+}
+
+ggml_backend_t Backend::handle() const {
+    return impl_ ? impl_->backend : nullptr;
 }
 
 void Backend::register_input(ggml_tensor* t, const void* host, size_t nbytes) {
@@ -172,15 +177,28 @@ ggml_tensor* graph_input_tensor(ggml_context* ctx, int type, int n_dims,
     return t;
 }
 
-ggml_tensor* clone_weight(ggml_context* ctx, const ModelLoader& ml,
+void ensure_weights_realized(const ModelLoader& ml) {
+    if (ml.weights_realized()) return;
+    // realize_weights mutates tensor->buffer; the ModelLoader is held by `const`
+    // ref throughout the inference path (the components are read-only views), but
+    // realizing the backend buffer is a one-time, semantically-const setup of the
+    // weight storage. Cast away const for that single call.
+    ModelLoader& mut = const_cast<ModelLoader&>(ml);
+    mut.realize_weights(global_backend().handle());
+}
+
+ggml_tensor* clone_weight(ggml_context* /*ctx*/, const ModelLoader& ml,
                           const char* name) {
+    // Zero-copy: ensure the loader's weights have a backend buffer once, then
+    // return the loader tensor DIRECTLY. It has ->data + ->buffer set, so the
+    // gallocr treats it as already-allocated (never copies it) and the CPU
+    // backend reads its bytes in place. Downstream reshapes/views of the
+    // returned tensor resolve their data pointer at build time (the src has
+    // data), so no per-call weight copy ever happens.
+    ensure_weights_realized(ml);
     ggml_tensor* src = ml.tensor(name);
     assert(src && "missing tensor");
-    const int nd = ggml_n_dims(src);
-    int64_t ne[4] = {1, 1, 1, 1};
-    for (int i = 0; i < nd; ++i) ne[i] = src->ne[i];
-    return graph_input_tensor(ctx, (int)src->type, nd, ne, src->data,
-                              ggml_nbytes(src));
+    return src;
 }
 
 ggml_tensor* clone_weight_opt(ggml_context* ctx, const ModelLoader& ml,

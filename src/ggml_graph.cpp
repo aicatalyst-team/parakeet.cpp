@@ -66,6 +66,7 @@ int g_backend_threads = 0;
 // worker threads), so this lock is uncontended; it only guards against a caller
 // that drives transcribe() concurrently from multiple threads.
 std::mutex g_backend_mutex;
+} // namespace
 
 Backend& global_backend() {
     std::call_once(g_backend_once, [] {
@@ -83,7 +84,6 @@ Backend& global_backend() {
     }
     return *g_backend;
 }
-} // namespace
 
 bool run_graph(size_t /*mem_bytes*/, int n_threads,
                const std::function<ggml_tensor*(ggml_context*)>& build,

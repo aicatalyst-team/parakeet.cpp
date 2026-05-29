@@ -5,6 +5,8 @@
 
 struct ggml_context;
 struct ggml_tensor;
+struct ggml_backend;
+typedef struct ggml_backend* ggml_backend_t;
 
 namespace pk {
 
@@ -47,6 +49,12 @@ public:
     // ggml_backend_cpu_set_n_threads). <=0 is clamped to 1.
     void set_n_threads(int n_threads);
     int  n_threads() const { return n_threads_; }
+
+    // The underlying CPU ggml backend. Exposed so the loader can give its weight
+    // tensors a backend buffer over the SAME backend graphs run on (see
+    // ModelLoader::realize_weights). Any CPU buffer is compatible with the CPU
+    // backend, but agreeing on one keeps the contract explicit.
+    ggml_backend_t handle() const;
 
     // Build + run a single graph on the persistent backend/gallocr and copy the
     // output tensor's f32 contents into `out`.
@@ -96,18 +104,24 @@ ggml_tensor* graph_input_tensor(ggml_context* ctx, int type, int n_dims,
                                 const int64_t* ne, const void* host,
                                 size_t nbytes);
 
-// Bring a weight tensor from the loader into the graph as an input. The loader
-// stores weights in an mmap'd ggml context (no backend buffer), so we cannot
-// reference them directly as graph leaves (a reshape/view of them would fail
-// ggml_backend_view_init, which requires the source to live in a backend
-// buffer). Instead we materialize a same-type, same-ne input tensor and copy
-// the loader's raw bytes into it after alloc. Allowlisted linears may be
-// f16/q8_0; the raw quantized bytes are copied through unchanged and
-// ggml_mul_mat dequantizes src0 on the fly. Returns nullptr iff `name` is
-// absent (for optional weights); asserts present otherwise via clone_weight.
+// Reference a weight tensor from the loader DIRECTLY as a graph leaf (ZERO
+// per-call copy). The loader gives every weight a CPU backend buffer ONCE at
+// load (ModelLoader::realize_weights, lazily ensured here on first use against
+// the process-global Backend). With the weight living in a backend buffer and
+// having ->data set, the gallocr treats it as already-allocated and never
+// touches it, and reshapes/views resolve their data at build time — so the
+// SAME bytes are reused across every utterance instead of being re-copied.
+// Allowlisted linears may be f16/q8_0; ggml_mul_mat dequantizes src0 on the
+// fly. Returns nullptr iff `name` is absent (clone_weight_opt); asserts present
+// otherwise (clone_weight). `ctx` is unused (kept for call-site compatibility).
 ggml_tensor* clone_weight(ggml_context* ctx, const ModelLoader& ml,
                           const char* name);
 ggml_tensor* clone_weight_opt(ggml_context* ctx, const ModelLoader& ml,
                               const char* name);
+
+// Ensure the loader's weights have a backend buffer (zero-copy) on the
+// process-global Backend. Idempotent; called automatically by clone_weight, but
+// exposed so the model/test load path can realize weights up front.
+void ensure_weights_realized(const ModelLoader& ml);
 
 } // namespace pk

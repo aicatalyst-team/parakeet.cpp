@@ -6,6 +6,10 @@
 struct ggml_tensor;
 struct ggml_context;
 struct gguf_context;
+struct ggml_backend_buffer;
+typedef struct ggml_backend_buffer* ggml_backend_buffer_t;
+struct ggml_backend;
+typedef struct ggml_backend* ggml_backend_t;
 namespace pk {
 // Cache-aware streaming params (Phase 5), populated only for streaming models
 // (att_context_style != "regular"). Mirrors NeMo CacheAwareStreamingConfig.
@@ -55,10 +59,23 @@ public:
     const std::vector<std::string>& tokenizer_pieces() const { return cfg_.tokenizer_pieces; }
     ggml_tensor* tensor(const std::string& name) const; // nullptr if absent
     ggml_context* ggml_ctx() const { return ctx_; }
+
+    // Give every weight tensor a CPU backend buffer (ONCE), so graphs can
+    // reference the loader's tensors DIRECTLY as leaves with zero per-call
+    // copying. The GGUF is loaded with no_alloc=false, so all weight data
+    // already lives in one contiguous ctx mem_buffer; this wraps that exact
+    // memory via ggml_backend_cpu_buffer_from_ptr (no data movement) and points
+    // every tensor's ->buffer at it. After this the weights are valid graph
+    // leaves on the CPU backend and reshapes/views of them resolve their data
+    // at build time. Idempotent; safe to call once at load. The backend must be
+    // the same CPU backend the compute path uses. Returns false on failure.
+    bool realize_weights(ggml_backend_t backend);
+    bool weights_realized() const { return weights_buf_ != nullptr; }
 private:
     ParakeetConfig cfg_;
     gguf_context* gguf_ = nullptr;
     ggml_context* ctx_ = nullptr;
+    ggml_backend_buffer_t weights_buf_ = nullptr;  // wraps ctx_ mem_buffer (zero-copy)
     std::unordered_map<std::string, ggml_tensor*> tensors_;
 };
 }
