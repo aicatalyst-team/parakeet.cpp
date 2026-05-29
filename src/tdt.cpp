@@ -1,8 +1,6 @@
 #include "tdt.hpp"
 #include <cassert>
 #include <cmath>
-#include <cstdio>
-#include <cstring>
 
 namespace pk {
 
@@ -57,12 +55,19 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
     int32_t last_token = -1;      // -1 sentinel: nothing emitted yet -> SOS.
     bool emitted_any = false;
 
+    // Precompute the encoder projection over ALL frames ONCE (one matmul on the
+    // persistent backend), reused for every step. The per-step joint below is a
+    // tight churn-free graph on the same backend. The old code rebuilt the full
+    // joint per (t,u) step (a fresh graph per step — the bulk of the
+    // per-utterance graph dispatches).
+    std::vector<float> enc_proj;   // row-major [T, joint_hidden]
+    joint.precompute_enc_proj(enc, T, enc_hidden, enc_proj);
+    const int H = joint.joint_hidden();
+
     // Scratch reused across inner steps.
     std::vector<float> g;
     PredState out_state;
     std::vector<float> logits;
-    int v_out = 0;
-    std::vector<float> enc_frame((size_t)enc_hidden);
 
     int t = 0;
     while (t < T) {
@@ -79,12 +84,14 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
             // Prediction net single step from the committed state.
             pred.step(last_label, is_sos, committed, g, out_state);
 
-            // Joint: enc[t] (T=1) x g (U=1) -> raw logits [V_plus].
-            std::memcpy(enc_frame.data(), &enc[(size_t)t * enc_hidden],
-                        (size_t)enc_hidden * sizeof(float));
-            joint.forward(enc_frame, /*T=*/1, enc_hidden,
-                          g, /*U=*/1, (int)g.size(), logits, v_out);
-            assert(v_out == V_plus);
+            // Joint for (t,u): precomputed enc_proj[t] x g -> raw logits [V_plus].
+            // `t` is always in [0, T): the outer loop guards the first inner
+            // iteration, and subsequent inner iterations only run when skip==0
+            // (t unchanged). A positive skip exits the inner loop. This matches
+            // the old per-step `enc[t*enc_hidden]` access exactly.
+            assert(t < T && "enc_proj row out of range");
+            joint.step_logits(enc_proj.data() + (size_t)t * H,
+                              g.data(), (int)g.size(), logits);
 
             // Split: token logits [0, token_count), duration logits [token_count, V_plus).
             const int k   = argmax(logits.data(), token_count);

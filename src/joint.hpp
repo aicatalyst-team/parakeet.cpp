@@ -38,6 +38,36 @@ public:
                  const std::vector<float>& pred, int U, int pred_hidden,
                  std::vector<float>& logits, int& V_plus) const;
 
+    // --- Churn-free greedy-decode fast path (used by rnnt/tdt greedy loops) ---
+    //
+    // The greedy decoders call the joint once per emitted (t,u) step. The old
+    // `forward(T=1,U=1,...)` rebuilt the FULL encoder projection per step (two
+    // graphs/step, ~187 dispatches/utterance). Instead, precompute the encoder
+    // projection over ALL T frames ONCE (one matmul, reused for every u), then
+    // run a tight per-step joint (pred projection + ReLU + output projection) on
+    // the PERSISTENT backend. Backend::compute reuses the backend + gallocr, so
+    // the per-step graphs are churn-free; ggml's multithreaded matmul wins here
+    // because the per-step joint is memory-bandwidth bound on the ~2.6 MB output
+    // weight (measured ~15x faster/step than a single-threaded C++ matvec).
+    // Quantized enc/pred weights are dequantized on the fly by ggml_mul_mat.
+
+    // enc_proj[t][h] = enc.weight·enc[t] + enc.bias, over all T frames.
+    // enc: row-major [T, enc_hidden]; out: row-major [T, joint_hidden].
+    void precompute_enc_proj(const std::vector<float>& enc, int T, int enc_hidden,
+                             std::vector<float>& enc_proj) const;
+
+    // Per-step joint logits for a single (t,u):
+    //   pred_proj[h] = pred.weight·g + pred.bias
+    //   f[h]         = ReLU(enc_proj_t[h] + pred_proj[h])
+    //   logits[v]    = joint_net.2.weight·f + joint_net.2.bias    → [V_plus]
+    // enc_proj_t: pointer to enc_proj row for frame t ([joint_hidden]).
+    // g:          prediction-net output for step u ([pred_hidden]).
+    void step_logits(const float* enc_proj_t,
+                     const float* g, int pred_hidden,
+                     std::vector<float>& logits) const;
+
+    int joint_hidden() const { return joint_hidden_; }
+
     // V_plus = vocab_size + 1 + num_durations
     int V_plus()       const { return V_plus_; }
     int vocab_size()   const { return vocab_size_; }
@@ -49,6 +79,9 @@ private:
     int vocab_size_;
     int num_durations_;
     int V_plus_;
+    // Cached for shape asserts on the projection inputs.
+    int enc_hidden_  = 0;   // ggml ne[0] of joint.enc.weight
+    int pred_hidden_ = 0;   // ggml ne[0] of joint.pred.weight
 };
 
 } // namespace pk

@@ -1,7 +1,6 @@
 #include "rnnt.hpp"
 #include <cassert>
 #include <cmath>
-#include <cstring>
 
 namespace pk {
 
@@ -59,12 +58,19 @@ std::vector<int32_t> rnnt_decode_frames(const PredictionNet& pred, const Joint& 
     // Tokens emitted in THIS call only (st.hyp accumulates across all calls).
     std::vector<int32_t> emitted_this_call;
 
+    // Precompute the encoder projection over ALL frames ONCE (one matmul on the
+    // persistent backend), reused for every step. The per-step joint below is a
+    // tight churn-free graph on the same backend. The old code rebuilt the full
+    // joint per (t,u) (a fresh graph per step, the bulk of the per-utterance
+    // graph dispatches).
+    std::vector<float> enc_proj;   // row-major [Tnew, joint_hidden]
+    joint.precompute_enc_proj(enc_frames, Tnew, enc_hidden, enc_proj);
+    const int H = joint.joint_hidden();
+
     // Scratch reused across inner steps.
     std::vector<float> g;
     PredState out_state;
     std::vector<float> logits;
-    int v_out = 0;
-    std::vector<float> enc_frame((size_t)enc_hidden);
 
     int t = 0;
     while (t < Tnew) {
@@ -79,12 +85,9 @@ std::vector<int32_t> rnnt_decode_frames(const PredictionNet& pred, const Joint& 
             // Prediction net single step from the committed state.
             pred.step(last_label, is_sos, st.state, g, out_state);
 
-            // Joint: enc[t] (T=1) x g (U=1) -> raw logits [V_plus=vocab+1].
-            std::memcpy(enc_frame.data(), &enc_frames[(size_t)t * enc_hidden],
-                        (size_t)enc_hidden * sizeof(float));
-            joint.forward(enc_frame, /*T=*/1, enc_hidden,
-                          g, /*U=*/1, (int)g.size(), logits, v_out);
-            assert(v_out == V_plus);
+            // Joint for (t,u): precomputed enc_proj[t] x g -> raw logits [V_plus].
+            joint.step_logits(enc_proj.data() + (size_t)t * H,
+                              g.data(), (int)g.size(), logits);
 
             const int k = argmax(logits.data(), token_count);
 
