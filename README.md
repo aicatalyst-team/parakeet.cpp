@@ -29,6 +29,14 @@ It also runs circles around whisper.cpp on the same audio: the 110M Parakeet is 
 
 parakeet.cpp is faster than NeMo's PyTorch runtime on every Parakeet model, on both CPU and GPU, and the transcripts come out byte-identical (WER 0 vs NeMo). Full methodology, all 10 models, quantization tradeoffs, and plots are in [`benchmarks/BENCHMARK.md`](benchmarks/BENCHMARK.md).
 
+### See it run
+
+The same clip fed to parakeet.cpp and to NeMo's own PyTorch runtime on the same GPU. The output comes out byte-for-byte identical, parakeet.cpp just gets there first (slowed down so the sub-100ms race is watchable):
+
+![parakeet.cpp vs NeMo on GPU: identical output, parakeet.cpp finishes first](benchmarks/media/gpu_duel.gif)
+
+More head-to-heads, same accuracy and far less compute: [vs whisper.cpp turbo on GPU](benchmarks/media/gpu_whisper_duel.mp4) (about 12x faster) and [vs whisper.cpp turbo on CPU](benchmarks/media/cpu_duel.mp4) (about 27x faster).
+
 CPU numbers (20-core x86, vs NeMo PyTorch-CPU, LibriSpeech test-clean, threads=8; RTFx is audio-seconds over processing-seconds, so higher is faster):
 
 | dtype | size vs f32 | speedup vs NeMo | accuracy |
