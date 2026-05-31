@@ -50,7 +50,9 @@ char* parakeet_capi_transcribe_pcm(parakeet_ctx* ctx, const float* samples,
 // parakeet_capi_transcribe_path (0=default,1=ctc,2=tdt/rnnt). On success returns
 // 0 and fills `out` (a caller-allocated array of `n_clips` char*) with malloc'd
 // NUL-terminated UTF-8 transcripts; release each with parakeet_capi_free_string.
-// Returns nonzero on error (and sets the context's last error).
+// On error returns nonzero, sets the context's last error (see
+// parakeet_capi_last_error), and leaves every out[] entry NULL: the caller owns
+// nothing and has nothing to free.
 int parakeet_capi_transcribe_pcm_batch(parakeet_ctx* ctx,
                                        const float* const* samples,
                                        const int* n_samples, int n_clips,

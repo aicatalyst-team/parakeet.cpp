@@ -257,6 +257,9 @@ extern "C" int parakeet_capi_transcribe_pcm_batch(parakeet_ctx* ctx,
         ctx->last_error = "invalid batch arguments";
         return 1;
     }
+    // Contract: on any error path (validation, exception, OOM) every out[]
+    // entry is left NULL, so the caller owns nothing and frees nothing.
+    for (int i = 0; i < n_clips; ++i) out[i] = nullptr;
     try {
         std::vector<std::vector<float>> pcms(n_clips);
         for (int i = 0; i < n_clips; ++i) {
@@ -272,7 +275,8 @@ extern "C" int parakeet_capi_transcribe_pcm_batch(parakeet_ctx* ctx,
         for (int i = 0; i < n_clips; ++i) {
             char* s = dup_to_c(texts[i]);
             if (!s) {
-                // Roll back the strings we already allocated this call.
+                // Roll back the strings already allocated this call so every
+                // out[] entry is NULL on return (out[i..] are already NULL).
                 for (int j = 0; j < i; ++j) { std::free(out[j]); out[j] = nullptr; }
                 ctx->last_error = "out of memory";
                 return 2;
