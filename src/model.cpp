@@ -110,13 +110,13 @@ std::string Model::transcribe_16k(const std::vector<float>& pcm16k,
     return decode_enc_out(loader_, enc_out, d_model, Tout, use_tdt);
 }
 
-std::vector<std::string> Model::transcribe_16k_batch(
-    const std::vector<std::vector<float>>& pcms16k, Decoder decoder) const {
-    const ParakeetConfig& cfg = loader_.config();
-    const bool use_tdt = (decoder == Decoder::kTDT)
-        || (decoder == Decoder::kDefault && arch_prefers_tdt(cfg.arch));
-
-    // 1. Per-clip mel, then stack to T_max.
+// Stage a batch of 16 kHz mono clips into a MelBatch: per-clip log-mel
+// (GpuMel on a non-CPU backend, else the byte-identical FFT MelFrontend),
+// zero-padded and stacked to the batch's longest clip (T_max). data layout is
+// [B][n_mels][T_max], index (b*n_mels+m)*T_max+t; valid_T[b] is each clip's
+// true frame count.
+static MelBatch build_mel_batch(const ModelLoader& loader,
+                                const std::vector<std::vector<float>>& pcms16k) {
     const bool gpu = std::string(pk::global_backend().device_name()) != "cpu";
     MelBatch mb;
     mb.B = (int)pcms16k.size();
@@ -125,8 +125,8 @@ std::vector<std::string> Model::transcribe_16k_batch(
     int n_mels = 0;
     for (int b = 0; b < mb.B; ++b) {
         int nm = 0, T = 0;
-        if (gpu) { GpuMel g(loader_); g.compute(pcms16k[b], feats[b], nm, T); }
-        else     { MelFrontend m(loader_); m.compute(pcms16k[b], feats[b], nm, T); }
+        if (gpu) { GpuMel g(loader); g.compute(pcms16k[b], feats[b], nm, T); }
+        else     { MelFrontend m(loader); m.compute(pcms16k[b], feats[b], nm, T); }
         n_mels = nm; Ts[b] = T;
     }
     mb.n_mels = n_mels;
@@ -139,6 +139,17 @@ std::vector<std::string> Model::transcribe_16k_batch(
             for (int t = 0; t < Ts[b]; ++t)
                 mb.data[((size_t)b * n_mels + m) * mb.T_max + t] =
                     feats[b][(size_t)m * Ts[b] + t];
+    return mb;
+}
+
+std::vector<std::string> Model::transcribe_16k_batch(
+    const std::vector<std::vector<float>>& pcms16k, Decoder decoder) const {
+    const ParakeetConfig& cfg = loader_.config();
+    const bool use_tdt = (decoder == Decoder::kTDT)
+        || (decoder == Decoder::kDefault && arch_prefers_tdt(cfg.arch));
+
+    // 1. Per-clip mel, then stack to T_max.
+    MelBatch mb = build_mel_batch(loader_, pcms16k);
 
     // 2. Batched encoder.
     Encoder encoder(loader_);
@@ -194,6 +205,12 @@ static Transcription decode_enc_out_with_timestamps(
         std::vector<float> logits; int vocab_plus_1 = 0;
         ctc.forward(enc_out, d_model, Tout, logits, vocab_plus_1);
         ctc_greedy(logits, Tout, vocab_plus_1, (int)cfg.blank_id, &toks);
+        // NeMo CTC word end_offset is the NEXT collapsed token's start frame
+        // (cumulative run lengths), not start+1. ctc_greedy emits span == 1;
+        // rewrite each token's span to (next_frame - frame) so group_words'
+        // frame+span rule reproduces NeMo's end_offset. The final token keeps
+        // span == 1 (its true run length is unknown to the collapse, and within
+        // the 1-frame word-end tolerance).
         for (size_t i = 0; i + 1 < toks.size(); ++i)
             toks[i].span = toks[i + 1].frame - toks[i].frame;
     }
@@ -251,28 +268,7 @@ std::vector<Transcription> Model::transcribe_16k_batch_with_timestamps(
     const bool use_tdt = (decoder == Decoder::kTDT)
         || (decoder == Decoder::kDefault && arch_prefers_tdt(cfg.arch));
 
-    const bool gpu = std::string(pk::global_backend().device_name()) != "cpu";
-    MelBatch mb;
-    mb.B = (int)pcms16k.size();
-    std::vector<std::vector<float>> feats(mb.B);
-    std::vector<int> Ts(mb.B, 0);
-    int n_mels = 0;
-    for (int b = 0; b < mb.B; ++b) {
-        int nm = 0, T = 0;
-        if (gpu) { GpuMel g(loader_); g.compute(pcms16k[b], feats[b], nm, T); }
-        else     { MelFrontend m(loader_); m.compute(pcms16k[b], feats[b], nm, T); }
-        n_mels = nm; Ts[b] = T;
-    }
-    mb.n_mels = n_mels;
-    mb.T_max = 0;
-    for (int b = 0; b < mb.B; ++b) mb.T_max = std::max(mb.T_max, Ts[b]);
-    mb.valid_T = Ts;
-    mb.data.assign((size_t)mb.B * n_mels * mb.T_max, 0.0f);
-    for (int b = 0; b < mb.B; ++b)
-        for (int m = 0; m < n_mels; ++m)
-            for (int t = 0; t < Ts[b]; ++t)
-                mb.data[((size_t)b * n_mels + m) * mb.T_max + t] =
-                    feats[b][(size_t)m * Ts[b] + t];
+    MelBatch mb = build_mel_batch(loader_, pcms16k);
 
     Encoder encoder(loader_);
     std::vector<std::vector<float>> enc_outs; int d_model = 0, Tout = 0;
