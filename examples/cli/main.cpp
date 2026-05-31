@@ -5,7 +5,16 @@
 #include "audio_io.hpp"
 #include "streaming.hpp"
 #include "transcription.hpp"
-#include "ggml_graph.hpp"   // pk::set_num_threads
+#include "ggml_graph.hpp"   // pk::set_num_threads, pk::global_backend
+#include "backend.hpp"      // pk::ensure_weights_realized
+#include "encoder.hpp"
+#include "prediction.hpp"
+#include "joint.hpp"
+#include "tdt.hpp"
+#include "rnnt.hpp"
+#include "transducer_batch.hpp"
+#include "mel.hpp"
+#include "mel_gpu.hpp"
 #include "ggml.h"
 #include "gguf.h"
 #include <chrono>
@@ -851,6 +860,198 @@ static int cmd_bench_batch(int argc, char** argv) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// bench-decode: encode ONE clip once, then time DECODE only -- serial (N
+// separate tdt_greedy/rnnt_greedy calls over N copies of the encoder output)
+// vs batched (transducer_greedy_batch over the same N copies) -- at several
+// batch sizes. Reports decode wall-clock and the batched/serial speedup so the
+// GPU win from batched decode can be measured in isolation from the encoder.
+//
+// The encoder cost is paid once and excluded; only the transducer decode loop
+// is timed. Each rep is averaged over R repetitions (best/min recorded). The
+// b=0 batched ids are compared against the serial ids (same clip, decode is
+// deterministic) as a correctness sanity check.
+// ---------------------------------------------------------------------------
+static int cmd_bench_decode(int argc, char** argv) {
+    std::string model, audio;
+    std::string batch_sizes_str = "1,4,8,16";
+    int threads = 0;  // 0 == unset -> use the persistent-backend default
+    int reps = 5;
+    for (int i = 0; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+            model = argv[++i];
+        } else if (std::strcmp(argv[i], "--audio") == 0 && i + 1 < argc) {
+            audio = argv[++i];
+        } else if (std::strcmp(argv[i], "--batch-sizes") == 0 && i + 1 < argc) {
+            batch_sizes_str = argv[++i];
+        } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            threads = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--reps") == 0 && i + 1 < argc) {
+            reps = std::atoi(argv[++i]);
+        }
+    }
+    if (model.empty() || audio.empty()) {
+        std::fprintf(stderr,
+            "usage: parakeet-cli bench-decode --model <m.gguf> --audio <wav> "
+            "[--batch-sizes 1,4,8,16] [--threads N] [--reps R]\n");
+        return 2;
+    }
+    if (reps < 1) reps = 1;
+
+    // Parse --batch-sizes (comma-separated positive ints).
+    std::vector<int> batch_sizes;
+    {
+        std::stringstream ss(batch_sizes_str);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            size_t b = tok.find_first_not_of(" \t");
+            if (b == std::string::npos) continue;
+            size_t e = tok.find_last_not_of(" \t");
+            int v = std::atoi(tok.substr(b, e - b + 1).c_str());
+            if (v > 0) batch_sizes.push_back(v);
+        }
+    }
+    if (batch_sizes.empty()) {
+        std::fprintf(stderr,
+            "parakeet-cli bench-decode: no valid --batch-sizes (want e.g. 1,4,8,16)\n");
+        return 2;
+    }
+
+    if (threads > 0) pk::set_num_threads(threads);
+    int reported_threads = threads > 0 ? threads : 8;  // kDefaultThreads
+
+    // Load the model components over the lower-level loader (we need the encoder
+    // / prediction / joint pieces, not the high-level Model::transcribe path).
+    pk::ModelLoader ml;
+    if (!ml.load(model)) {
+        std::fprintf(stderr, "parakeet-cli bench-decode: failed to load model %s\n",
+                     model.c_str());
+        return 1;
+    }
+    pk::ensure_weights_realized(ml);
+    pk::Encoder       enc(ml);
+    pk::PredictionNet pred(ml);
+    pk::Joint         joint(ml);
+    const auto& cfg = ml.config();
+    const int blank = (int)cfg.blank_id;
+    const int maxs  = (int)cfg.max_symbols;
+    const std::vector<int32_t> durations = cfg.tdt_durations;
+
+    // Load the WAV.
+    pk::Audio a;
+    if (!pk::load_audio_16k_mono(audio, a)) {
+        std::fprintf(stderr, "parakeet-cli bench-decode: failed to load audio %s\n",
+                     audio.c_str());
+        return 1;
+    }
+
+    // Mel front end (GpuMel on a non-CPU backend, else FFT MelFrontend), exactly
+    // as model.cpp's transcribe path does.
+    std::vector<float> feats;
+    int n_mels = 0, T = 0;
+    if (std::string(pk::global_backend().device_name()) != "cpu") {
+        pk::GpuMel gmel(ml);
+        gmel.compute(a.samples, feats, n_mels, T);
+    } else {
+        pk::MelFrontend mel(ml);
+        mel.compute(a.samples, feats, n_mels, T);
+    }
+
+    // Encoder -> enc_out [d_model, Tout] (channels-first); transpose to row-major
+    // enc_row [Tout, d_model] as the decoders expect.
+    std::vector<float> enc_out;
+    int dm = 0, Tout = 0;
+    enc.forward(feats, n_mels, T, enc_out, dm, Tout);
+    std::vector<float> enc_row((size_t)Tout * dm);
+    for (int t = 0; t < Tout; ++t)
+        for (int c = 0; c < dm; ++c)
+            enc_row[(size_t)t * dm + c] = enc_out[(size_t)c * Tout + t];
+
+    const bool use_tdt = !durations.empty();
+    auto decode_serial_one = [&]() -> std::vector<int32_t> {
+        return use_tdt
+            ? pk::tdt_greedy(pred, joint, enc_row, Tout, dm, durations, blank, maxs, nullptr)
+            : pk::rnnt_greedy(pred, joint, enc_row, Tout, dm, blank, maxs, nullptr);
+    };
+
+    using clock = std::chrono::steady_clock;
+    auto ms_since = [](clock::time_point t0) {
+        return std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+    };
+
+    // Warm up (untimed): realize weights / CUDA kernels for both paths.
+    std::vector<int32_t> serial_ref = decode_serial_one();
+    {
+        std::vector<std::vector<float>> encs1{enc_row};
+        std::vector<int> Ts1{Tout};
+        std::vector<std::vector<int32_t>> ids1;
+        pk::transducer_greedy_batch(pred, joint, encs1, Ts1, dm, durations,
+                                    blank, maxs, ids1, nullptr);
+    }
+
+    struct Row { int B; double serial_ms; double batched_ms; double speedup;
+                 double serial_cps; double batched_cps; };
+    std::vector<Row> rows;
+    rows.reserve(batch_sizes.size());
+    bool sanity_ok = true;
+
+    for (int B : batch_sizes) {
+        std::vector<std::vector<float>> encs((size_t)B, enc_row);
+        std::vector<int> Ts((size_t)B, Tout);
+
+        // SERIAL: B separate single-clip decodes, best of R reps.
+        double serial_ms = 1e300;
+        for (int r = 0; r < reps; ++r) {
+            auto t0 = clock::now();
+            for (int b = 0; b < B; ++b) (void)decode_serial_one();
+            serial_ms = std::min(serial_ms, ms_since(t0));
+        }
+
+        // BATCHED: one transducer_greedy_batch over the B copies, best of R reps.
+        double batched_ms = 1e300;
+        std::vector<std::vector<int32_t>> ids_last;
+        for (int r = 0; r < reps; ++r) {
+            std::vector<std::vector<int32_t>> ids;
+            auto t0 = clock::now();
+            pk::transducer_greedy_batch(pred, joint, encs, Ts, dm, durations,
+                                        blank, maxs, ids, nullptr);
+            batched_ms = std::min(batched_ms, ms_since(t0));
+            ids_last = std::move(ids);
+        }
+
+        // Sanity: batched ids[0] must equal the serial decode of the same clip.
+        if (!ids_last.empty() && ids_last[0] != serial_ref) {
+            sanity_ok = false;
+            std::fprintf(stderr,
+                "parakeet-cli bench-decode: WARN B=%d batched ids[0] != serial "
+                "(%zu vs %zu tokens) -- batched decode may be buggy\n",
+                B, ids_last[0].size(), serial_ref.size());
+        }
+
+        double speedup     = batched_ms > 0.0 ? serial_ms / batched_ms : 0.0;
+        double serial_cps  = serial_ms  > 0.0 ? (double)B / (serial_ms  / 1000.0) : 0.0;
+        double batched_cps = batched_ms > 0.0 ? (double)B / (batched_ms / 1000.0) : 0.0;
+        rows.push_back({B, serial_ms, batched_ms, speedup, serial_cps, batched_cps});
+    }
+
+    // Human-readable table to stderr.
+    std::fprintf(stderr,
+        "\nbench-decode: clip Tout=%d frames, d_model=%d, decoder=%s, threads=%d, "
+        "reps=%d (best-of), backend=%s\n",
+        Tout, dm, use_tdt ? "tdt" : "rnnt", reported_threads, reps,
+        pk::global_backend().device_name());
+    std::fprintf(stderr, "  %-6s %-12s %-12s %-10s %-14s %-14s\n",
+                 "B", "serial_ms", "batched_ms", "speedup", "serial_cps", "batched_cps");
+    for (const Row& r : rows) {
+        std::fprintf(stderr, "  %-6d %-12.2f %-12.2f %-10.2f %-14.1f %-14.1f\n",
+                     r.B, r.serial_ms, r.batched_ms, r.speedup,
+                     r.serial_cps, r.batched_cps);
+    }
+    std::fprintf(stderr, "  sanity (batched ids[0]==serial): %s\n",
+                 sanity_ok ? "OK" : "MISMATCH (see WARN above)");
+    return 0;
+}
+
 // Run a subcommand, then free the process-global backend while the GPU driver is
 // still alive (the subcommand's local Model is already destroyed by the time it
 // returns, releasing its device weight buffer). Avoids the CUDA "driver shutting
@@ -870,6 +1071,8 @@ int main(int argc, char** argv) {
         return run_and_shutdown(cmd_quantize, argc - 2, argv + 2);
     if (argc >= 2 && std::strcmp(argv[1], "bench-batch") == 0)
         return run_and_shutdown(cmd_bench_batch, argc - 2, argv + 2);
+    if (argc >= 2 && std::strcmp(argv[1], "bench-decode") == 0)
+        return run_and_shutdown(cmd_bench_decode, argc - 2, argv + 2);
     if (argc >= 2 && std::strcmp(argv[1], "bench") == 0)
         return run_and_shutdown(cmd_bench, argc - 2, argv + 2);
     std::fprintf(stderr,
@@ -882,6 +1085,8 @@ int main(int argc, char** argv) {
         "  parakeet-cli bench --model <model.gguf> --manifest <file> "
         "[--decoder ctc|tdt] [--threads N] [--json <out>]\n"
         "  parakeet-cli bench-batch --model <model.gguf> --manifest <file> "
-        "[--decoder ctc|tdt] [--threads N] [--batch-sizes 1,4,8] [--json <out>]\n");
+        "[--decoder ctc|tdt] [--threads N] [--batch-sizes 1,4,8] [--json <out>]\n"
+        "  parakeet-cli bench-decode --model <model.gguf> --audio <wav> "
+        "[--batch-sizes 1,4,8,16] [--threads N] [--reps R]\n");
     return 2;
 }
