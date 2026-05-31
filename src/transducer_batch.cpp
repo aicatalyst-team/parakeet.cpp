@@ -82,6 +82,19 @@ void transducer_greedy_batch(
         return false;
     };
 
+    // Commit item n's state columns (offset n*Hp, all L layers, both h and c)
+    // from out_state into committed. Used on every emit in both branches.
+    auto commit_state = [&](int n) {
+        for (int l = 0; l < L; ++l) {
+            std::memcpy(&committed.h[l][(size_t)n * Hp],
+                        &out_state.h[l][(size_t)n * Hp], (size_t)Hp * sizeof(float));
+            std::memcpy(&committed.c[l][(size_t)n * Hp],
+                        &out_state.c[l][(size_t)n * Hp], (size_t)Hp * sizeof(float));
+        }
+    };
+
+    // Assumes max_symbols >= 1 (NeMo default 10). The per-round emit rule below
+    // mirrors the oracle inner loops, which never run at max_symbols==0.
     while (any_active()) {
         // (1) ONE batched prediction step from the committed state for ALL items.
         // Build inputs from committed last_token/have_token. Inactive items still
@@ -96,7 +109,7 @@ void transducer_greedy_batch(
         // run ONE batched joint step -> logits[Vp*N].
         for (int n = 0; n < N; ++n) {
             int tf = t[n];
-            if (tf < 0) tf = 0;
+            if (tf < 0) tf = 0;                 // t[n] only grows from 0; lower clamp is defensive. Upper clamp matters for inactive/boundary columns.
             if (tf > T[n] - 1) tf = T[n] - 1;   // clamp (boundary / inactive)
             if (T[n] <= 0) tf = 0;              // no frames: harmless, ignored
             const float* src = (T[n] > 0) ? (ep[n].data() + (size_t)tf * Hj) : ep[n].data();
@@ -128,13 +141,7 @@ void transducer_greedy_batch(
                     }
                     last_token[n] = (int32_t)k;
                     have_token[n] = 1;
-                    // Commit this item's columns from out_state into committed.
-                    for (int l = 0; l < L; ++l) {
-                        std::memcpy(&committed.h[l][(size_t)n * Hp],
-                                    &out_state.h[l][(size_t)n * Hp], (size_t)Hp * sizeof(float));
-                        std::memcpy(&committed.c[l][(size_t)n * Hp],
-                                    &out_state.c[l][(size_t)n * Hp], (size_t)Hp * sizeof(float));
-                    }
+                    commit_state(n);
                 }
                 // ALWAYS: symbols_added += 1; t += skip; need_loop = (skip == 0).
                 sym_at_frame[n] += 1;
@@ -164,12 +171,7 @@ void transducer_greedy_batch(
                     }
                     last_token[n] = (int32_t)k;
                     have_token[n] = 1;
-                    for (int l = 0; l < L; ++l) {
-                        std::memcpy(&committed.h[l][(size_t)n * Hp],
-                                    &out_state.h[l][(size_t)n * Hp], (size_t)Hp * sizeof(float));
-                        std::memcpy(&committed.c[l][(size_t)n * Hp],
-                                    &out_state.c[l][(size_t)n * Hp], (size_t)Hp * sizeof(float));
-                    }
+                    commit_state(n);
                     sym_at_frame[n] += 1;
                     // emitted == max_symbols exits the inner while -> advance frame.
                     if (sym_at_frame[n] >= max_symbols) {
