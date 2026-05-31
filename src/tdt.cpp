@@ -1,37 +1,9 @@
 #include "tdt.hpp"
+#include "decode_common.hpp"
 #include <cassert>
 #include <cmath>
 
 namespace pk {
-
-namespace {
-// argmax over a[0..n) returning the first index of the maximum value.
-// torch.max(dim) returns the FIRST max index on ties; match that.
-int argmax(const float* a, int n) {
-    int best = 0;
-    float bv = a[0];
-    for (int i = 1; i < n; ++i) {
-        if (a[i] > bv) { bv = a[i]; best = i; }
-    }
-    return best;
-}
-
-// NeMo's rescaled `max_prob` confidence (method 'max_prob', alpha==1.0):
-//   conf = (N * p_max - 1) / (N - 1),  p_max = softmax(slice)[argmax].
-// Computed numerically from the RAW logit slice a[0..n): p_max is the softmax
-// probability of the argmax over the slice (equivalently exp of the max
-// log_softmax value), and N == n (the slice size = num token classes incl.
-// blank). Stable softmax (subtract the max).
-float max_prob_conf_logits(const float* a, int n, int k) {
-    float mx = a[0];
-    for (int i = 1; i < n; ++i) if (a[i] > mx) mx = a[i];
-    double denom = 0.0;
-    for (int i = 0; i < n; ++i) denom += std::exp((double)a[i] - (double)mx);
-    const double p_max = std::exp((double)a[k] - (double)mx) / denom;
-    const double N = (double)n;
-    return (float)((N * p_max - 1.0) / (N - 1.0));
-}
-} // namespace
 
 std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
                                 const std::vector<float>& enc, int T, int enc_hidden,
@@ -102,8 +74,8 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
                               g.data(), (int)g.size(), logits);
 
             // Split: token logits [0, token_count), duration logits [token_count, V_plus).
-            const int k   = argmax(logits.data(), token_count);
-            const int d_k = argmax(logits.data() + token_count, num_dur);
+            const int k   = decode_argmax(logits.data(), token_count);
+            const int d_k = decode_argmax(logits.data() + token_count, num_dur);
             skip = durations[d_k];
 
             // Commit state + last_token ONLY when k != blank.
@@ -117,7 +89,7 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
                     //           (NeMo log_softmaxes that slice; exclude the duration
                     //           logits). N = token_count = vocab + 1.
                     //   span  = durations[d_k] (the duration/skip applied to the token).
-                    const float conf = max_prob_conf_logits(logits.data(), token_count, k);
+                    const float conf = decode_max_prob_conf(logits.data(), token_count, k);
                     tokens->push_back(TokenInfo{ (int32_t)k, (int32_t)t, conf,
                                                  (int32_t)skip });
                 }

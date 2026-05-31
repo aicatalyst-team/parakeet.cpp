@@ -1,36 +1,9 @@
 #include "rnnt.hpp"
+#include "decode_common.hpp"
 #include <cassert>
 #include <cmath>
 
 namespace pk {
-
-namespace {
-// argmax over a[0..n) returning the first index of the maximum value.
-// torch.max(dim) returns the FIRST max index on ties; match that.
-int argmax(const float* a, int n) {
-    int best = 0;
-    float bv = a[0];
-    for (int i = 1; i < n; ++i) {
-        if (a[i] > bv) { bv = a[i]; best = i; }
-    }
-    return best;
-}
-
-// NeMo's rescaled `max_prob` confidence (method 'max_prob', alpha==1.0):
-//   conf = (N * p_max - 1) / (N - 1),  p_max = softmax(logits)[k].
-// For RNN-T the confidence slice is the FULL joint output vector (V_plus =
-// vocab + 1, blank included; no durations) — NeMo log_softmaxes the whole
-// joint output. N == n (the slice size). Stable softmax (subtract the max).
-float max_prob_conf_logits(const float* a, int n, int k) {
-    float mx = a[0];
-    for (int i = 1; i < n; ++i) if (a[i] > mx) mx = a[i];
-    double denom = 0.0;
-    for (int i = 0; i < n; ++i) denom += std::exp((double)a[i] - (double)mx);
-    const double p_max = std::exp((double)a[k] - (double)mx) / denom;
-    const double N = (double)n;
-    return (float)((N * p_max - 1.0) / (N - 1.0));
-}
-} // namespace
 
 RnntDecodeState rnnt_decode_init(const PredictionNet& pred) {
     RnntDecodeState st;
@@ -103,7 +76,7 @@ std::vector<int32_t> rnnt_decode_frames(const PredictionNet& pred, const Joint& 
             joint.step_logits(enc_proj.data() + (size_t)t * H,
                               g.data(), (int)g.size(), logits);
 
-            const int k = argmax(logits.data(), token_count);
+            const int k = decode_argmax(logits.data(), token_count);
 
             // Blank -> stop emitting at this frame and advance time.
             if (k == blank_id) break;
@@ -117,7 +90,7 @@ std::vector<int32_t> rnnt_decode_frames(const PredictionNet& pred, const Joint& 
                 // max_prob confidence): frame = the (local) encoder frame t at
                 // emission, conf = max_prob over the full joint output vector
                 // (N = V_plus = vocab+1), span = 1 (RNN-T advances one frame).
-                const float conf = max_prob_conf_logits(logits.data(), token_count, k);
+                const float conf = decode_max_prob_conf(logits.data(), token_count, k);
                 tokens->push_back(TokenInfo{ (int32_t)k, (int32_t)t, conf, 1 });
             }
             st.last_token = (int32_t)k;
