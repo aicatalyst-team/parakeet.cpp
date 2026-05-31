@@ -44,6 +44,19 @@ char* parakeet_capi_transcribe_path(parakeet_ctx* ctx, const char* wav_path,
 char* parakeet_capi_transcribe_pcm(parakeet_ctx* ctx, const float* samples,
                                    int n_samples, int sample_rate, int decoder);
 
+// Transcribe a batch of in-memory mono float PCM clips. `samples` is an array of
+// `n_clips` pointers and `n_samples` an array of `n_clips` per-clip lengths; each
+// clip is resampled to 16 kHz if `sample_rate != 16000`. `decoder` is as in
+// parakeet_capi_transcribe_path (0=default,1=ctc,2=tdt/rnnt). On success returns
+// 0 and fills `out` (a caller-allocated array of `n_clips` char*) with malloc'd
+// NUL-terminated UTF-8 transcripts; release each with parakeet_capi_free_string.
+// Returns nonzero on error (and sets the context's last error).
+int parakeet_capi_transcribe_pcm_batch(parakeet_ctx* ctx,
+                                       const float* const* samples,
+                                       const int* n_samples, int n_clips,
+                                       int sample_rate, int decoder,
+                                       char** out);
+
 // Transcribe a WAV file returning a malloc'd UTF-8 JSON document with per-word
 // and per-token timestamps + confidence (matching NeMo timestamps=True and the
 // 'max_prob' confidence method). `decoder` is as in
