@@ -26,6 +26,7 @@ pk_add_test(test_streaming_encoder)
 pk_add_test(test_ctc)
 pk_add_test(test_prediction)
 pk_add_test(test_prediction_step)
+pk_add_test(test_prediction_step_batch)
 pk_add_test(test_joint)
 pk_add_test(test_transducer_core)
 pk_add_test(test_tdt_greedy)
@@ -50,7 +51,7 @@ pk_add_test(test_capi_batch_json)
 set_tests_properties(test_model_loader test_mel test_mel_gpu test_subsampling test_subsampling_batch test_relpos_attention test_relpos_attention_batch
                      test_conformer test_conformer_batch test_conv_eou test_encoder test_encoder_batch test_encoder_eou
                      test_streaming_encoder test_ctc test_prediction
-                     test_prediction_step
+                     test_prediction_step test_prediction_step_batch
                      test_joint test_transducer_core test_tdt_greedy
                      test_timestamps_tokens test_timestamps test_transcribe_batch_ts test_tokenizer test_transcribe
                      test_transcribe_speech test_transcribe_tdt test_transcribe_0_6b
@@ -61,7 +62,7 @@ set_tests_properties(test_model_loader test_mel test_mel_gpu test_subsampling te
 # These tests read fixtures/baselines via paths relative to the project root.
 set_tests_properties(test_mel test_mel_gpu test_subsampling test_subsampling_batch test_relpos_attention test_relpos_attention_batch test_conformer test_conformer_batch
                      test_conv_eou test_encoder test_encoder_batch test_encoder_eou test_streaming_encoder
-                     test_ctc test_prediction test_prediction_step
+                     test_ctc test_prediction test_prediction_step test_prediction_step_batch
                      test_joint
                      test_transducer_core test_tdt_greedy test_timestamps_tokens
                      test_timestamps test_transcribe_batch_ts

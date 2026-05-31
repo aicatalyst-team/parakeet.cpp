@@ -14,6 +14,13 @@ struct PredState {
     std::vector<std::vector<float>> c; // c[layer] = [hidden]
 };
 
+// Batched LSTM state: one (h,c) per layer, each holding N items' columns laid
+// out [H*N] (item n at offset n*H). Generalizes PredState to a batch.
+struct BatchedPredState {
+    std::vector<std::vector<float>> h; // h[layer] size H*N
+    std::vector<std::vector<float>> c; // c[layer] size H*N
+};
+
 // RNN-Transducer prediction network — NeMo RNNTDecoder prediction net.
 //
 // Architecture:
@@ -66,6 +73,18 @@ public:
               const PredState& in,
               std::vector<float>& g,
               PredState& out_state) const;
+
+    // Advance the LSTM one token for N items at once.
+    // token_ids[n]: embedding index for item n (ignored where is_sos[n]).
+    // is_sos[n]:    use the zero SOS input for item n (1=true).
+    // in:           batched prior state (h[L],c[L] each [H*N]).
+    // g:            OUT, top-layer h' for all items [H*N] (item n at n*H).
+    // out_state:    OUT, new batched (h',c').
+    void step_batch(const std::vector<int32_t>& token_ids,
+                    const std::vector<uint8_t>& is_sos,
+                    const BatchedPredState& in,
+                    std::vector<float>& g,
+                    BatchedPredState& out_state) const;
 
     int hidden_size() const { return H_; }
 

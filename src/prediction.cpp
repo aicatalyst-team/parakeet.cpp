@@ -113,6 +113,87 @@ void PredictionNet::step(int32_t token_id, bool is_sos,
 }
 
 // ---------------------------------------------------------------------------
+// Batched single-step advance: the same LSTM math as step(), but with a batch
+// axis N. Inputs and state are laid out [H, N] in ggml (item n is column n,
+// offset n*H in the flat host buffer). Gate slices become [H, N] views into the
+// [4H, N] z, using z->nb[1] as the column stride. N=1 reduces to step().
+// ---------------------------------------------------------------------------
+void PredictionNet::step_batch(const std::vector<int32_t>& token_ids,
+                               const std::vector<uint8_t>& is_sos,
+                               const BatchedPredState& in,
+                               std::vector<float>& g,
+                               BatchedPredState& out_state) const {
+    const int H = H_;
+    const int L = n_layers_;
+    const int N = (int)token_ids.size();
+    assert(N > 0 && (int)is_sos.size() == N && "batch size mismatch");
+
+    // Lazily fetch the embedding table to the host (device-safe), exactly as
+    // step() does.
+    if (embed_host_.empty()) {
+        pk::ensure_weights_realized(ml_);
+        ggml_tensor* emb = ml_.tensor("decoder.prediction.embed.weight");
+        assert(emb && "missing decoder.prediction.embed.weight");
+        embed_host_.resize((size_t)vocab_p1_ * H);
+        ggml_backend_tensor_get(emb, embed_host_.data(), 0, ggml_nbytes(emb));
+    }
+
+    // Layer-0 input [H*N]: zeros for SOS items, else the embedding row.
+    std::vector<float> x0((size_t)H * N, 0.0f);
+    for (int n = 0; n < N; ++n) {
+        if (!is_sos[n]) {
+            assert(token_ids[n] >= 0 && token_ids[n] < vocab_p1_ && "embedding id out of range");
+            std::memcpy(&x0[(size_t)n * H], &embed_host_[(size_t)token_ids[n] * H],
+                        (size_t)H * sizeof(float));
+        }
+    }
+
+    out_state.h.assign((size_t)L, std::vector<float>((size_t)H * N));
+    out_state.c.assign((size_t)L, std::vector<float>((size_t)H * N));
+
+    bool ok = pk::run_graph(0, 0, [&](ggml_context* ctx) -> ggml_tensor* {
+        int64_t ne2[2] = { H, N };
+        ggml_tensor* layer_in = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, ne2,
+                                    x0.data(), (size_t)H * N * sizeof(float));
+        ggml_tensor* top_h = nullptr;
+        for (int l = 0; l < L; ++l) {
+            const std::string s = "_l" + std::to_string(l);
+            ggml_tensor* Wih = pk::clone_weight(ctx, ml_,
+                ("decoder.prediction.dec_rnn.lstm.weight_ih" + s).c_str());
+            ggml_tensor* Whh = pk::clone_weight(ctx, ml_,
+                ("decoder.prediction.dec_rnn.lstm.weight_hh" + s).c_str());
+            ggml_tensor* bih = pk::clone_weight(ctx, ml_,
+                ("decoder.prediction.dec_rnn.lstm.bias_ih" + s).c_str());
+            ggml_tensor* bhh = pk::clone_weight(ctx, ml_,
+                ("decoder.prediction.dec_rnn.lstm.bias_hh" + s).c_str());
+            ggml_tensor* h_in = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, ne2,
+                                    in.h[l].data(), (size_t)H * N * sizeof(float));
+            ggml_tensor* c_in = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, ne2,
+                                    in.c[l].data(), (size_t)H * N * sizeof(float));
+            // z = W_ih·x + b_ih + W_hh·h_in + b_hh                  [4H, N]
+            // (bias [4H] broadcasts over the N columns).
+            ggml_tensor* z = ggml_add(ctx,
+                ggml_add(ctx, ggml_mul_mat(ctx, Wih, layer_in), bih),
+                ggml_add(ctx, ggml_mul_mat(ctx, Whh, h_in),     bhh));
+            // Gate slices (i, f, g, o), each [H, N]; column stride is z->nb[1].
+            ggml_tensor* i  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_2d(ctx, z, H, N, z->nb[1], 0)));
+            ggml_tensor* f  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_2d(ctx, z, H, N, z->nb[1], (size_t)H * sizeof(float))));
+            ggml_tensor* gg = ggml_tanh   (ctx, ggml_cont(ctx, ggml_view_2d(ctx, z, H, N, z->nb[1], (size_t)2 * H * sizeof(float))));
+            ggml_tensor* o  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_2d(ctx, z, H, N, z->nb[1], (size_t)3 * H * sizeof(float))));
+            // c' = f*c_in + i*g ;  h' = o*tanh(c')
+            ggml_tensor* c_out = ggml_add(ctx, ggml_mul(ctx, f, c_in), ggml_mul(ctx, i, gg));
+            ggml_tensor* h_out = ggml_mul(ctx, o, ggml_tanh(ctx, c_out));
+            pk::capture_graph_output(c_out, &out_state.c[l]);
+            pk::capture_graph_output(h_out, &out_state.h[l]);
+            layer_in = h_out;
+            top_h    = h_out;
+        }
+        return top_h;
+    }, g);
+    assert(ok && "pred-net step_batch graph failed");
+}
+
+// ---------------------------------------------------------------------------
 // Full-sequence forward pass (unchanged API; now driven by step() so there is a
 // single LSTM implementation). Carries (h, c) state across timesteps; the
 // output at step t is the top layer's h'. add_sos prepends a zero SOS step.
