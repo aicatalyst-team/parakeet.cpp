@@ -156,6 +156,9 @@ std::vector<std::string> Model::transcribe_16k_batch(
 std::vector<std::string> Model::transcribe_pcm_batch(
     const std::vector<std::vector<float>>& pcms, int sample_rate,
     Decoder decoder) const {
+    if (sample_rate <= 0) {
+        throw std::runtime_error("parakeet: invalid sample_rate");
+    }
     std::vector<std::vector<float>> r(pcms.size());
     for (size_t i = 0; i < pcms.size(); ++i)
         r[i] = (sample_rate == 16000) ? pcms[i]
