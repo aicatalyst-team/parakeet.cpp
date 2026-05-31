@@ -94,4 +94,31 @@ void Encoder::forward_capture(const std::vector<float>& mel, int n_mels, int T,
     Tout = Tp;
 }
 
+void Encoder::forward_batch(const MelBatch& mels,
+                            std::vector<std::vector<float>>& enc_outs,
+                            int& d_model, int& Tout,
+                            std::vector<int>& valid_Tout) const {
+    // Phase 1: correctness-first per-item loop. Phase 5 replaces the body with a
+    // single fused batched graph; the signature stays the same.
+    enc_outs.assign(mels.B, {});
+    valid_Tout.assign(mels.B, 0);
+    int dm = 0, tp = 0;
+    for (int b = 0; b < mels.B; ++b) {
+        // Slice item b's [n_mels, valid_T[b]] out of the padded buffer.
+        const int Tb = mels.valid_T[b];
+        std::vector<float> mel_b((size_t)mels.n_mels * Tb);
+        for (int m = 0; m < mels.n_mels; ++m)
+            for (int t = 0; t < Tb; ++t)
+                mel_b[(size_t)m * Tb + t] =
+                    mels.data[((size_t)b * mels.n_mels + m) * mels.T_max + t];
+        int dmb = 0, toutb = 0;
+        forward(mel_b, mels.n_mels, Tb, enc_outs[b], dmb, toutb);
+        dm = dmb;
+        if (toutb > tp) tp = toutb;
+        valid_Tout[b] = toutb;
+    }
+    d_model = dm;
+    Tout = tp;
+}
+
 } // namespace pk
