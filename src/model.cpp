@@ -16,6 +16,7 @@
 #include "backend.hpp"
 #include "ggml_graph.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <vector>
 
@@ -47,6 +48,38 @@ std::unique_ptr<Model> Model::load(const std::string& gguf_path) {
     return m;
 }
 
+// Decode one item's encoder output (row-major [d_model, Tout], channels-first)
+// into a transcript. Mirrors the tail of transcribe_16k exactly.
+static std::string decode_enc_out(const ModelLoader& loader,
+                                  const std::vector<float>& enc_out,
+                                  int d_model, int Tout, bool use_tdt) {
+    const ParakeetConfig& cfg = loader.config();
+    if (use_tdt) {
+        std::vector<float> enc_row((size_t)Tout * d_model);
+        for (int t = 0; t < Tout; ++t)
+            for (int c = 0; c < d_model; ++c)
+                enc_row[(size_t)t * d_model + c] = enc_out[(size_t)c * Tout + t];
+        PredictionNet pred(loader);
+        Joint        joint(loader);
+        const int max_symbols = static_cast<int>(cfg.max_symbols);
+        std::vector<int32_t> ids;
+        if (!cfg.tdt_durations.empty())
+            ids = tdt_greedy(pred, joint, enc_row, Tout, d_model,
+                             cfg.tdt_durations, (int)cfg.blank_id, max_symbols);
+        else
+            ids = rnnt_greedy(pred, joint, enc_row, Tout, d_model,
+                              (int)cfg.blank_id, max_symbols);
+        return detokenize(loader.tokenizer_pieces(), ids);
+    } else {
+        CTCDecoder ctc(loader);
+        std::vector<float> logits; int vocab_plus_1 = 0;
+        ctc.forward(enc_out, d_model, Tout, logits, vocab_plus_1);
+        std::vector<int32_t> ids = ctc_greedy(logits, Tout, vocab_plus_1,
+                                              (int)cfg.blank_id);
+        return detokenize(loader.tokenizer_pieces(), ids);
+    }
+}
+
 std::string Model::transcribe_16k(const std::vector<float>& pcm16k,
                                   Decoder decoder) const {
     const ParakeetConfig& cfg = loader_.config();
@@ -74,53 +107,60 @@ std::string Model::transcribe_16k(const std::vector<float>& pcm16k,
     const bool use_tdt = (decoder == Decoder::kTDT)
         || (decoder == Decoder::kDefault && arch_prefers_tdt(cfg.arch));
 
-    if (use_tdt) {
-        // 3a. TDT path: transpose encoder output to row-major [Tout, d_model].
-        //     enc_out from Encoder is [d_model, Tout] (channels-first).
-        std::vector<float> enc_row(static_cast<size_t>(Tout) * d_model);
-        for (int t = 0; t < Tout; ++t)
-            for (int c = 0; c < d_model; ++c)
-                enc_row[t * d_model + c] = enc_out[c * Tout + t];
+    return decode_enc_out(loader_, enc_out, d_model, Tout, use_tdt);
+}
 
-        // 3b. Prediction net + Joint.
-        PredictionNet pred(loader_);
-        Joint        joint(loader_);
+std::vector<std::string> Model::transcribe_16k_batch(
+    const std::vector<std::vector<float>>& pcms16k, Decoder decoder) const {
+    const ParakeetConfig& cfg = loader_.config();
+    const bool use_tdt = (decoder == Decoder::kTDT)
+        || (decoder == Decoder::kDefault && arch_prefers_tdt(cfg.arch));
 
-        // max_symbols: greedy max symbols emitted per frame, read from the model
-        // metadata (parakeet.decoding.max_symbols; NeMo default 10).
-        const int max_symbols = static_cast<int>(cfg.max_symbols);
-
-        // Branch on the duration table: TDT (durations present) uses the
-        // duration-aware greedy loop; a pure RNNT transducer (no durations, e.g.
-        // arch ∈ {rnnt, hybrid_rnnt_ctc}) uses the standard RNNT greedy loop.
-        std::vector<int32_t> ids;
-        if (!cfg.tdt_durations.empty()) {
-            ids = tdt_greedy(
-                pred, joint, enc_row, Tout, d_model,
-                cfg.tdt_durations, static_cast<int>(cfg.blank_id), max_symbols);
-        } else {
-            ids = rnnt_greedy(
-                pred, joint, enc_row, Tout, d_model,
-                static_cast<int>(cfg.blank_id), max_symbols);
-        }
-
-        // 4a. Detokenize.
-        return detokenize(loader_.tokenizer_pieces(), ids);
-
-    } else {
-        // 3b. CTC path: head -> log-probs [Tout, vocab+1].
-        CTCDecoder ctc(loader_);
-        std::vector<float> logits;
-        int vocab_plus_1 = 0;
-        ctc.forward(enc_out, d_model, Tout, logits, vocab_plus_1);
-
-        // 4b. CTC greedy collapse -> token ids. Blank is the last column.
-        const int blank_id = static_cast<int>(cfg.blank_id);
-        std::vector<int32_t> ids = ctc_greedy(logits, Tout, vocab_plus_1, blank_id);
-
-        // 5b. Detokenize.
-        return detokenize(loader_.tokenizer_pieces(), ids);
+    // 1. Per-clip mel, then stack to T_max.
+    const bool gpu = std::string(pk::global_backend().device_name()) != "cpu";
+    MelBatch mb;
+    mb.B = (int)pcms16k.size();
+    std::vector<std::vector<float>> feats(mb.B);
+    std::vector<int> Ts(mb.B, 0);
+    int n_mels = 0;
+    for (int b = 0; b < mb.B; ++b) {
+        int nm = 0, T = 0;
+        if (gpu) { GpuMel g(loader_); g.compute(pcms16k[b], feats[b], nm, T); }
+        else     { MelFrontend m(loader_); m.compute(pcms16k[b], feats[b], nm, T); }
+        n_mels = nm; Ts[b] = T;
     }
+    mb.n_mels = n_mels;
+    mb.T_max = 0;
+    for (int b = 0; b < mb.B; ++b) mb.T_max = std::max(mb.T_max, Ts[b]);
+    mb.valid_T = Ts;
+    mb.data.assign((size_t)mb.B * n_mels * mb.T_max, 0.0f);
+    for (int b = 0; b < mb.B; ++b)
+        for (int m = 0; m < n_mels; ++m)
+            for (int t = 0; t < Ts[b]; ++t)
+                mb.data[((size_t)b * n_mels + m) * mb.T_max + t] =
+                    feats[b][(size_t)m * Ts[b] + t];
+
+    // 2. Batched encoder.
+    Encoder encoder(loader_);
+    std::vector<std::vector<float>> enc_outs; int d_model = 0, Tout = 0;
+    std::vector<int> valid_Tout;
+    encoder.forward_batch(mb, enc_outs, d_model, Tout, valid_Tout);
+
+    // 3. Per-item decode (each enc_out is [d_model, valid_Tout[b]]).
+    std::vector<std::string> outs(mb.B);
+    for (int b = 0; b < mb.B; ++b)
+        outs[b] = decode_enc_out(loader_, enc_outs[b], d_model, valid_Tout[b], use_tdt);
+    return outs;
+}
+
+std::vector<std::string> Model::transcribe_pcm_batch(
+    const std::vector<std::vector<float>>& pcms, int sample_rate,
+    Decoder decoder) const {
+    std::vector<std::vector<float>> r(pcms.size());
+    for (size_t i = 0; i < pcms.size(); ++i)
+        r[i] = (sample_rate == 16000) ? pcms[i]
+                                      : resample_linear(pcms[i], sample_rate, 16000);
+    return transcribe_16k_batch(r, decoder);
 }
 
 Transcription Model::transcribe_16k_with_timestamps(
