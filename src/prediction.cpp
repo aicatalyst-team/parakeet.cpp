@@ -175,7 +175,10 @@ void PredictionNet::step_batch(const std::vector<int32_t>& token_ids,
             ggml_tensor* z = ggml_add(ctx,
                 ggml_add(ctx, ggml_mul_mat(ctx, Wih, layer_in), bih),
                 ggml_add(ctx, ggml_mul_mat(ctx, Whh, h_in),     bhh));
-            // Gate slices (i, f, g, o), each [H, N]; column stride is z->nb[1].
+            // Gate slices (i, f, g, o), each [H, N]. The view keeps z's FULL
+            // column stride (z->nb[1] = 4H elems), reading only H contiguous
+            // elements per column, so consecutive columns skip the other three
+            // gate blocks. (Do NOT change the stride to H*sizeof(float).)
             ggml_tensor* i  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_2d(ctx, z, H, N, z->nb[1], 0)));
             ggml_tensor* f  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_2d(ctx, z, H, N, z->nb[1], (size_t)H * sizeof(float))));
             ggml_tensor* gg = ggml_tanh   (ctx, ggml_cont(ctx, ggml_view_2d(ctx, z, H, N, z->nb[1], (size_t)2 * H * sizeof(float))));
