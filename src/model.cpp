@@ -11,6 +11,7 @@
 #include "joint.hpp"
 #include "tdt.hpp"
 #include "rnnt.hpp"
+#include "transducer_batch.hpp"
 #include "transcription.hpp"
 #include "decode_types.hpp"
 #include "backend.hpp"
@@ -157,10 +158,35 @@ std::vector<std::string> Model::transcribe_16k_batch(
     std::vector<int> valid_Tout;
     encoder.forward_batch(mb, enc_outs, d_model, Tout, valid_Tout);
 
-    // 3. Per-item decode (each enc_out is [d_model, valid_Tout[b]]).
+    // 3. Decode (each enc_out is [d_model, valid_Tout[b]]).
     std::vector<std::string> outs(mb.B);
-    for (int b = 0; b < mb.B; ++b)
-        outs[b] = decode_enc_out(loader_, enc_outs[b], d_model, valid_Tout[b], use_tdt);
+    if (use_tdt) {
+        // Batched transducer (TDT/RNNT) greedy decode: build per-item row-major
+        // [T, d_model] from the channels-first [d_model, T] encoder outputs.
+        std::vector<std::vector<float>> encs(mb.B);
+        std::vector<int> Ts(mb.B);
+        for (int b = 0; b < mb.B; ++b) {
+            const int tb = valid_Tout[b];
+            Ts[b] = tb;
+            std::vector<float>& er = encs[b];
+            er.resize((size_t)tb * d_model);
+            for (int t = 0; t < tb; ++t)
+                for (int c = 0; c < d_model; ++c)
+                    er[(size_t)t * d_model + c] = enc_outs[b][(size_t)c * tb + t];
+        }
+        PredictionNet pred(loader_);
+        Joint        joint(loader_);
+        std::vector<std::vector<int32_t>> ids;
+        pk::transducer_greedy_batch(pred, joint, encs, Ts, d_model,
+                                    cfg.tdt_durations, (int)cfg.blank_id,
+                                    (int)cfg.max_symbols, ids, nullptr);
+        for (int b = 0; b < mb.B; ++b)
+            outs[b] = detokenize(loader_.tokenizer_pieces(), ids[b]);
+    } else {
+        // CTC stays per-item (no autoregressive decode to batch).
+        for (int b = 0; b < mb.B; ++b)
+            outs[b] = decode_enc_out(loader_, enc_outs[b], d_model, valid_Tout[b], use_tdt);
+    }
     return outs;
 }
 
@@ -276,9 +302,41 @@ std::vector<Transcription> Model::transcribe_16k_batch_with_timestamps(
     encoder.forward_batch(mb, enc_outs, d_model, Tout, valid_Tout);
 
     std::vector<Transcription> outs(mb.B);
-    for (int b = 0; b < mb.B; ++b)
-        outs[b] = decode_enc_out_with_timestamps(
-            loader_, enc_outs[b], d_model, valid_Tout[b], use_tdt, frame_sec);
+    if (use_tdt) {
+        // Batched transducer (TDT/RNNT) greedy decode with timestamps. Build
+        // per-item row-major [T, d_model] from channels-first [d_model, T].
+        std::vector<std::vector<float>> encs(mb.B);
+        std::vector<int> Ts(mb.B);
+        for (int b = 0; b < mb.B; ++b) {
+            const int tb = valid_Tout[b];
+            Ts[b] = tb;
+            std::vector<float>& er = encs[b];
+            er.resize((size_t)tb * d_model);
+            for (int t = 0; t < tb; ++t)
+                for (int c = 0; c < d_model; ++c)
+                    er[(size_t)t * d_model + c] = enc_outs[b][(size_t)c * tb + t];
+        }
+        PredictionNet pred(loader_);
+        Joint        joint(loader_);
+        std::vector<std::vector<int32_t>> ids;
+        std::vector<std::vector<TokenInfo>> toks;
+        pk::transducer_greedy_batch(pred, joint, encs, Ts, d_model,
+                                    cfg.tdt_durations, (int)cfg.blank_id,
+                                    (int)cfg.max_symbols, ids, &toks);
+        // Assemble each Transcription exactly as decode_enc_out_with_timestamps'
+        // transducer tail does.
+        for (int b = 0; b < mb.B; ++b) {
+            Transcription& result = outs[b];
+            result.text   = detokenize(loader_.tokenizer_pieces(), ids[b]);
+            result.words  = group_words(toks[b], loader_.tokenizer_pieces(), frame_sec);
+            result.tokens = std::move(toks[b]);
+        }
+    } else {
+        // CTC stays per-item (not a transducer; no autoregressive decode).
+        for (int b = 0; b < mb.B; ++b)
+            outs[b] = decode_enc_out_with_timestamps(
+                loader_, enc_outs[b], d_model, valid_Tout[b], use_tdt, frame_sec);
+    }
     return outs;
 }
 
