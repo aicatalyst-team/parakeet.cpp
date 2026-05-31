@@ -64,6 +64,15 @@ void transducer_greedy_batch(
     std::vector<int> sym_at_frame(N, 0);
     for (int n = 0; n < N; ++n) active[n] = (T[n] > 0) ? 1 : 0;
 
+    // Per-item prediction-net cache validity. 0 = stale (g column must be
+    // recomputed before the joint), 1 = fresh (the persistent `g` buffer still
+    // holds this item's correct column from a prior round). All stale initially
+    // so the first round runs pred from SOS. Mirrors tdt.cpp/rnnt.cpp `g_valid`:
+    // set false on emit (committed state advanced), reused otherwise. Bit-exact:
+    // recomputing g from an UNCHANGED committed state yields an identical g, so
+    // skipping the pred step on all-valid rounds reuses the same values.
+    std::vector<uint8_t> g_valid(N, 0);
+
     // Committed batched LSTM state, zero-initialized [L][Hp*N].
     BatchedPredState committed;
     committed.h.assign((size_t)L, std::vector<float>((size_t)Hp * N, 0.0f));
@@ -96,14 +105,28 @@ void transducer_greedy_batch(
     // Assumes max_symbols >= 1 (NeMo default 10). The per-round emit rule below
     // mirrors the oracle inner loops, which never run at max_symbols==0.
     while (any_active()) {
-        // (1) ONE batched prediction step from the committed state for ALL items.
-        // Build inputs from committed last_token/have_token. Inactive items still
-        // need valid inputs (their output is ignored): SOS / blank_id.
+        // (1) Batched prediction step from the committed state, but only when
+        // some active item's cache is stale. If every active item already has a
+        // fresh `g` column (no emit since it was last computed), the persistent
+        // `g` buffer still holds the correct values and we skip the LSTM forward
+        // entirely — the same per-item caching as tdt.cpp/rnnt.cpp, batched.
+        bool any_stale = false;
         for (int n = 0; n < N; ++n) {
-            is_sos[n]    = have_token[n] ? 0 : 1;
-            token_ids[n] = have_token[n] ? last_token[n] : (int32_t)blank_id;
+            if (active[n] && !g_valid[n]) { any_stale = true; break; }
         }
-        pred.step_batch(token_ids, is_sos, committed, g, out_state);
+        if (any_stale) {
+            // Build inputs from committed last_token/have_token. Inactive items
+            // still need valid inputs (their output is ignored): SOS / blank_id.
+            for (int n = 0; n < N; ++n) {
+                is_sos[n]    = have_token[n] ? 0 : 1;
+                token_ids[n] = have_token[n] ? last_token[n] : (int32_t)blank_id;
+            }
+            pred.step_batch(token_ids, is_sos, committed, g, out_state);
+            // Every active item's g column is now fresh. (Recomputing a
+            // non-emitter's g from its unchanged committed state reproduces its
+            // cached value bit-for-bit, so marking it valid is exact.)
+            for (int n = 0; n < N; ++n) if (active[n]) g_valid[n] = 1;
+        }
 
         // (2) Gather each active item's enc_proj row for its current frame and
         // run ONE batched joint step -> logits[Vp*N].
@@ -142,6 +165,7 @@ void transducer_greedy_batch(
                     last_token[n] = (int32_t)k;
                     have_token[n] = 1;
                     commit_state(n);
+                    g_valid[n] = 0;   // committed state advanced -> g stale next round
                 }
                 // ALWAYS: symbols_added += 1; t += skip; need_loop = (skip == 0).
                 sym_at_frame[n] += 1;
@@ -172,6 +196,7 @@ void transducer_greedy_batch(
                     last_token[n] = (int32_t)k;
                     have_token[n] = 1;
                     commit_state(n);
+                    g_valid[n] = 0;   // committed state advanced -> g stale next round
                     sym_at_frame[n] += 1;
                     // emitted == max_symbols exits the inner while -> advance frame.
                     if (sym_at_frame[n] >= max_symbols) {
