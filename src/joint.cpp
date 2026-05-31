@@ -103,6 +103,45 @@ void Joint::step_logits(const float* enc_proj_t,
     assert(ok && "step_logits graph failed");
 }
 
+void Joint::step_logits_batch(const float* enc_proj_gathered,
+                              const float* g, int pred_hidden, int n,
+                              std::vector<float>& logits) const {
+    assert(pred_hidden == pred_hidden_ && "pred_hidden mismatch");
+    const int H = joint_hidden_;
+
+    // Batched per-step joint over N items on the PERSISTENT backend. Mirrors
+    // step_logits with a batch axis (ggml ne1 = N): each of the two matmuls is
+    // applied across all N columns at once, and the biases broadcast over N.
+    // N=1 reduces exactly to step_logits. The gathered enc_proj input holds one
+    // joint_hidden row per item (item k at offset k*H), and g holds one
+    // pred_hidden vector per item (item k at offset k*pred_hidden).
+    bool ok = pk::run_graph(0, 0,
+        [&](ggml_context* ctx) -> ggml_tensor* {
+            // Gathered enc_proj rows: [H, N].
+            int64_t ep_ne[2] = { H, n };
+            ggml_tensor* ep = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, ep_ne,
+                                  enc_proj_gathered, (size_t)H * n * sizeof(float));
+            // Batched pred-net output g: [P, N].
+            int64_t g_ne[2] = { pred_hidden_, n };
+            ggml_tensor* gv = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, g_ne,
+                                  g, (size_t)pred_hidden_ * n * sizeof(float));
+            // pred_proj = pred.weight·g + pred.bias  (P->H). Weight ne=[P,H].
+            ggml_tensor* Wp = pk::clone_weight(ctx, ml_, "joint.pred.weight");
+            ggml_tensor* pp = ggml_mul_mat(ctx, Wp, gv);            // [H, N]
+            ggml_tensor* bp = pk::clone_weight(ctx, ml_, "joint.pred.bias");
+            pp = ggml_add(ctx, pp, bp);                             // bp [H] broadcasts over N
+            // f = ReLU(enc_proj + pred_proj)
+            ggml_tensor* f = ggml_relu(ctx, ggml_add(ctx, ep, pp)); // [H, N]
+            // logits = joint_net.2.weight·f + joint_net.2.bias (H->V). Weight ne=[H,V].
+            ggml_tensor* Wo = pk::clone_weight(ctx, ml_, "joint.joint_net.2.weight");
+            ggml_tensor* y  = ggml_mul_mat(ctx, Wo, f);             // [V, N]
+            ggml_tensor* bo = pk::clone_weight(ctx, ml_, "joint.joint_net.2.bias");
+            y = ggml_add(ctx, y, bo);                               // bo [V] broadcasts over N
+            return y;                                               // [V_plus, N]
+        }, logits);
+    assert(ok && "step_logits_batch graph failed");
+}
+
 void Joint::forward(const std::vector<float>& enc,  int T, int enc_hidden,
                     const std::vector<float>& pred, int U, int pred_hidden,
                     std::vector<float>& logits, int& V_plus_out) const {

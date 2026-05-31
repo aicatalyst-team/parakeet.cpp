@@ -66,6 +66,15 @@ public:
                      const float* g, int pred_hidden,
                      std::vector<float>& logits) const;
 
+    // Batched per-step joint for N items.
+    // enc_proj_gathered: [joint_hidden * N], each item's enc_proj row for its
+    //   current frame (item n at offset n*joint_hidden).
+    // g:                 [pred_hidden * N], batched pred output (item n at n*pred_hidden).
+    // logits out:        [V_plus * N], item n at offset n*V_plus.
+    void step_logits_batch(const float* enc_proj_gathered,
+                           const float* g, int pred_hidden, int n,
+                           std::vector<float>& logits) const;
+
     int joint_hidden() const { return joint_hidden_; }
 
     // V_plus = vocab_size + 1 + num_durations
