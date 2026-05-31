@@ -93,35 +93,59 @@ ggml_tensor* Subsampling::build_graph_batched(ggml_context* ctx,
     };
 
     // NeMo's MaskedConvSequential zeros the trailing (pad) time frames of the
-    // conv input BEFORE every stage. For the SYMMETRIC (offline) path a valid
-    // output frame never reaches a masked input frame (centred kernel), so the
-    // old code masks only the flattened output and stays byte-identical — keep
-    // that. For the CAUSAL path the right pad is +1, so the last valid output
-    // frame DOES read the trailing pad input frame; replicate the per-stage
-    // input masking via a [1,H,1,1] mask broadcast over W (feat) and C.
-    auto mask_time = [&](ggml_tensor* t, int valid_t) -> ggml_tensor* {
-        const int H = (int)t->ne[1];
-        if (valid_t >= H) return t;
-        std::vector<float>& md = pool.alloc_f32(H);
-        for (int h = 0; h < H; ++h) md[h] = (h < valid_t) ? 1.0f : 0.0f;
-        int64_t m_ne[4] = {1, H, 1, 1};
+    // conv input BEFORE every stage. We replicate this per-item, per-stage in
+    // BOTH paths:
+    //   - Causal: the right pad is +1, so the last valid output frame DOES read
+    //     the trailing pad input frame; per-stage input masking is required for
+    //     correctness even at B=1.
+    //   - Non-causal (offline), B>1: a shorter clip is zero-padded to T_max, but
+    //     after every conv stage bias+ReLU make the padded time region NON-ZERO,
+    //     so the last valid output frame of a short item reads contaminated
+    //     values instead of the clean conv zero-edge a standalone clip sees.
+    //     Zeroing the trailing pad time frames before each stage reproduces the
+    //     standalone boundary (the conv's own symmetric pad supplies clean zeros).
+    // The mask is per-item: [1, H, 1, B], md[b*H + h] = (h < vt[b]) ? 1 : 0,
+    // broadcasting over ne0 (W=feat) and ne2 (C).
+    auto mask_time = [&](ggml_tensor* t, const std::vector<int>& vt) -> ggml_tensor* {
+        const int H  = (int)t->ne[1];
+        const int Bx = (int)t->ne[3];
+        bool any = false;
+        for (int b = 0; b < Bx; ++b) {
+            int v = (b < (int)vt.size()) ? vt[b] : H;
+            if (v < H) { any = true; break; }
+        }
+        if (!any) return t;
+        std::vector<float>& md = pool.alloc_f32((size_t)Bx * H);
+        for (int b = 0; b < Bx; ++b) {
+            int v = (b < (int)vt.size()) ? vt[b] : H;
+            for (int h = 0; h < H; ++h)
+                md[(size_t)b * H + h] = (h < v) ? 1.0f : 0.0f;
+        }
+        int64_t m_ne[4] = {1, H, 1, Bx};
         ggml_tensor* tm = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 4, m_ne,
                               md.data(), md.size() * sizeof(float));
-        return ggml_mul(ctx, t, tm); // broadcast over ne0(W), ne2(C), ne3
+        return ggml_mul(ctx, t, tm); // broadcast over ne0(W), ne2(C)
     };
-    // Per-stage time masking is causal-only and single-item (B==1 asserted above),
-    // so derive the entry valid length from item 0.
-    const int in_valid_frames = valid_in.empty() ? -1 : valid_in[0];
-    int valid_t0 = (in_valid_frames >= 0) ? in_valid_frames : (T - 1); // before stage 0
-    int valid_t1 = (valid_t0 + 3 - 3) / 2 + 1;  // before stage 2 (after stage 0)
-    int valid_t2 = (valid_t1 + 3 - 3) / 2 + 1;  // before stage 5 (after stage 2)
+    // Per-item per-stage valid TIME lengths at the INPUT of each conv stage,
+    // mirroring valid_out_len's recurrence (and the old single-item valid_t0/1/2).
+    const int all_paddings = causal_ ? 3 : 2;
+    std::vector<int> vt_stage0(B), vt_stage1(B), vt_stage2(B); // input of stage0/1/2
+    for (int b = 0; b < B; ++b) {
+        int vi = (b < (int)valid_in.size()) ? valid_in[b] : -1;
+        int v0 = (vi >= 0) ? vi : (T - 1);          // before stage 0
+        int v1 = (v0 + all_paddings - 3) / 2 + 1;   // before stage 1 (after stage 0)
+        int v2 = (v1 + all_paddings - 3) / 2 + 1;   // before stage 2 (after stage 1)
+        vt_stage0[b] = v0;
+        vt_stage1[b] = v1;
+        vt_stage2[b] = v2;
+    }
 
     // ---- Stage 1: full Conv2d(1 -> C, k=3, s=2) + ReLU ----
     // kernel conv.0.weight: torch [C,1,3,3] -> ggml ne [3,3,1,C] = [KW,KH,IC,OC].
     ggml_tensor* w0 = clone_weight(ctx, ml, "encoder.pre_encode.conv.0.weight");
     ggml_tensor* b0 = clone_weight(ctx, ml, "encoder.pre_encode.conv.0.bias");
+    x = mask_time(x, vt_stage0);      // zero trailing pad time frames (both paths)
     if (causal) {
-        x = mask_time(x, valid_t0);   // zero trailing pad mel frames
         x = pad_causal(x);
         x = ggml_conv_2d(ctx, w0, x, /*s0*/2, /*s1*/2, /*p0*/0, /*p1*/0, /*d0*/1, /*d1*/1);
     } else {
@@ -140,15 +164,15 @@ ggml_tensor* Subsampling::build_graph_batched(ggml_context* ctx,
         { "encoder.pre_encode.conv.5.weight", "encoder.pre_encode.conv.5.bias",
           "encoder.pre_encode.conv.6.weight", "encoder.pre_encode.conv.6.bias" },
     };
-    int stage_valid_t[2] = {valid_t1, valid_t2};
+    const std::vector<int>* stage_valid_t[2] = {&vt_stage1, &vt_stage2};
     for (int si = 0; si < 2; ++si) {
         const StageW& s = stages[si];
         // Depthwise: weight torch [C,1,3,3] -> ggml ne [3,3,1,C] = [KW,KH,1,C].
         // ggml_conv_2d_dw_direct expects a:[KW,KH,1,C], b:[W,H,C,N].
         ggml_tensor* dww = clone_weight(ctx, ml, s.dw_w);
         ggml_tensor* dwb = clone_weight(ctx, ml, s.dw_b);
+        x = mask_time(x, *stage_valid_t[si]); // zero trailing pad time frames (both paths)
         if (causal) {
-            x = mask_time(x, stage_valid_t[si]); // zero trailing pad time frames
             x = pad_causal(x);
             x = ggml_conv_2d_dw_direct(ctx, dww, x, /*s0*/2, /*s1*/2, /*p0*/0, /*p1*/0, /*d0*/1, /*d1*/1);
         } else {
