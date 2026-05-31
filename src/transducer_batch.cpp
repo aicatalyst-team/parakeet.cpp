@@ -12,10 +12,10 @@ namespace pk {
 // EXACT per-item rule from the oracle to each item independently.
 //
 // Parity rationale:
-//  - The per-item `g_valid` cache (skip the LSTM forward on non-emitting steps)
-//    is a pure speed optimization: recomputing g from the SAME committed state
-//    yields an identical g. So we recompute g for every active item each round
-//    (one batched LSTM forward) without changing any result.
+//  - The per-item `g_valid` cache (skip the batched LSTM forward on rounds where
+//    no active item emitted) is a pure speed optimization: recomputing g from the
+//    SAME committed state yields an identical g, so reusing the cached g column is
+//    byte-identical. Mirrors the per-item `g_valid` in tdt.cpp/rnnt.cpp.
 //  - State recovery / masking: we only copy out_state columns into `committed`
 //    for items that emitted this round; non-emitting items keep their prior
 //    committed columns, exactly as the per-item loop leaves committed unchanged
