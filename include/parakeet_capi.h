@@ -80,8 +80,10 @@ char* parakeet_capi_transcribe_path_json(parakeet_ctx* ctx, const char* wav_path
 // is a JSON ARRAY of n_clips objects, each identical in shape to
 // parakeet_capi_transcribe_path_json's document ({"text","words","tokens"}).
 // samples_concat holds all clips' 16 kHz mono float samples concatenated;
-// n_samples gives each clip's sample count (their sum is the length of
-// samples_concat); n_clips is the array length. decoder: 0=default,1=ctc,2=tdt.
+// n_samples gives each clip's sample count; n_clips is the array length.
+// decoder: 0=default,1=ctc,2=tdt. PRECONDITION (caller MUST uphold, not
+// validated here): the sum of n_samples[0..n_clips) equals the number of floats
+// in samples_concat. A larger sum reads out of bounds.
 // Returns the JSON string on success (free with parakeet_capi_free_string), or
 // NULL on error (see parakeet_capi_last_error).
 char* parakeet_capi_transcribe_pcm_batch_json(parakeet_ctx* ctx,
