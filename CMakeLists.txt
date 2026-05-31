@@ -76,6 +76,7 @@ set(PARAKEET_SRC
     src/joint.cpp
     src/tdt.cpp
     src/rnnt.cpp
+    src/transducer_batch.cpp
     src/tokenizer.cpp
     src/search.cpp
     src/transcription.cpp)
