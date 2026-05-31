@@ -143,6 +143,24 @@ static MelBatch build_mel_batch(const ModelLoader& loader,
     return mb;
 }
 
+// Transpose the batched encoder outputs (channels-first [d_model, valid_Tout[b]])
+// into per-item row-major [valid_Tout[b], d_model] for the transducer decoder.
+static void batch_enc_to_row_major(const std::vector<std::vector<float>>& enc_outs,
+                                   const std::vector<int>& valid_Tout, int d_model,
+                                   std::vector<std::vector<float>>& encs,
+                                   std::vector<int>& Ts) {
+    const int B = (int)enc_outs.size();
+    encs.assign(B, {}); Ts.assign(B, 0);
+    for (int b = 0; b < B; ++b) {
+        const int tb = valid_Tout[b];
+        Ts[b] = tb;
+        encs[b].resize((size_t)tb * d_model);
+        for (int t = 0; t < tb; ++t)
+            for (int c = 0; c < d_model; ++c)
+                encs[b][(size_t)t * d_model + c] = enc_outs[b][(size_t)c * tb + t];
+    }
+}
+
 std::vector<std::string> Model::transcribe_16k_batch(
     const std::vector<std::vector<float>>& pcms16k, Decoder decoder) const {
     const ParakeetConfig& cfg = loader_.config();
@@ -163,17 +181,9 @@ std::vector<std::string> Model::transcribe_16k_batch(
     if (use_tdt) {
         // Batched transducer (TDT/RNNT) greedy decode: build per-item row-major
         // [T, d_model] from the channels-first [d_model, T] encoder outputs.
-        std::vector<std::vector<float>> encs(mb.B);
-        std::vector<int> Ts(mb.B);
-        for (int b = 0; b < mb.B; ++b) {
-            const int tb = valid_Tout[b];
-            Ts[b] = tb;
-            std::vector<float>& er = encs[b];
-            er.resize((size_t)tb * d_model);
-            for (int t = 0; t < tb; ++t)
-                for (int c = 0; c < d_model; ++c)
-                    er[(size_t)t * d_model + c] = enc_outs[b][(size_t)c * tb + t];
-        }
+        std::vector<std::vector<float>> encs;
+        std::vector<int> Ts;
+        batch_enc_to_row_major(enc_outs, valid_Tout, d_model, encs, Ts);
         PredictionNet pred(loader_);
         Joint        joint(loader_);
         std::vector<std::vector<int32_t>> ids;
@@ -305,17 +315,9 @@ std::vector<Transcription> Model::transcribe_16k_batch_with_timestamps(
     if (use_tdt) {
         // Batched transducer (TDT/RNNT) greedy decode with timestamps. Build
         // per-item row-major [T, d_model] from channels-first [d_model, T].
-        std::vector<std::vector<float>> encs(mb.B);
-        std::vector<int> Ts(mb.B);
-        for (int b = 0; b < mb.B; ++b) {
-            const int tb = valid_Tout[b];
-            Ts[b] = tb;
-            std::vector<float>& er = encs[b];
-            er.resize((size_t)tb * d_model);
-            for (int t = 0; t < tb; ++t)
-                for (int c = 0; c < d_model; ++c)
-                    er[(size_t)t * d_model + c] = enc_outs[b][(size_t)c * tb + t];
-        }
+        std::vector<std::vector<float>> encs;
+        std::vector<int> Ts;
+        batch_enc_to_row_major(enc_outs, valid_Tout, d_model, encs, Ts);
         PredictionNet pred(loader_);
         Joint        joint(loader_);
         std::vector<std::vector<int32_t>> ids;
