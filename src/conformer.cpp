@@ -82,26 +82,41 @@ static ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
     // Transpose ne0<->ne1 (keep batch on ne2): [D,T,B] -> [T,C,B].
     ggml_tensor* glu_tcb = ggml_cont(ctx, ggml_permute(ctx, glu, 1, 0, 2, 3)); // [T, C, B]
     ggml_tensor* dww = clone_weight(ctx, ml, pre + "conv.depthwise_conv.weight"); // [K,1,C]
-    ggml_tensor* dw;
+    ggml_tensor* dw = nullptr;
     {
-        // im2col layout: [W=T, H=1, C, N=B].
-        ggml_tensor* nb = ggml_reshape_4d(ctx, glu_tcb,
-                              glu_tcb->ne[0], 1, glu_tcb->ne[1], B); // [T,1,C,B]
-        ggml_tensor* ic;
-        if (conv_causal) {
-            ggml_tensor* nbp = ggml_pad_ext(ctx, nb, /*lp0*/K - 1, /*rp0*/0,
-                                            0, 0, 0, 0, 0, 0); // [T+K-1,1,C,B]
-            ic = ggml_im2col(ctx, dww, nbp, /*s0*/1, /*s1*/0,
-                             /*p0*/0, /*p1*/0, /*d0*/1, /*d1*/0,
-                             /*is_2D*/false, GGML_TYPE_F32);
-        } else {
-            ic = ggml_im2col(ctx, dww, nb, /*s0*/1, /*s1*/0,
-                             /*p0*/pad, /*p1*/0, /*d0*/1, /*d1*/0,
-                             /*is_2D*/false, GGML_TYPE_F32);
+        // ggml's 1D im2col asserts b->ne[3] == 1, so the depthwise conv cannot
+        // take a batch dim. Run it per item (each slice has ne[3]==1, exactly the
+        // B=1 path) and reassemble along the batch axis. For B==1 the loop runs
+        // once and skips the concat, so the result is byte-identical to before.
+        const int Tn = (int)glu_tcb->ne[0];
+        const int Cn = (int)glu_tcb->ne[1];
+        for (int bi = 0; bi < B; ++bi) {
+            // item bi's [T, C, 1] slice out of glu_tcb [T, C, B]; cont for im2col.
+            ggml_tensor* item = ggml_view_3d(ctx, glu_tcb, Tn, Cn, 1,
+                                             glu_tcb->nb[1], glu_tcb->nb[2],
+                                             (size_t)bi * glu_tcb->nb[2]); // [T,C,1]
+            item = ggml_cont(ctx, item);
+            // im2col layout: [W=T, H=1, C, N=1].
+            ggml_tensor* nb = ggml_reshape_4d(ctx, item, Tn, 1, Cn, 1); // [T,1,C,1]
+            ggml_tensor* ic;
+            if (conv_causal) {
+                ggml_tensor* nbp = ggml_pad_ext(ctx, nb, /*lp0*/K - 1, /*rp0*/0,
+                                                0, 0, 0, 0, 0, 0); // [T+K-1,1,C,1]
+                ic = ggml_im2col(ctx, dww, nbp, /*s0*/1, /*s1*/0,
+                                 /*p0*/0, /*p1*/0, /*d0*/1, /*d1*/0,
+                                 /*is_2D*/false, GGML_TYPE_F32);
+            } else {
+                ic = ggml_im2col(ctx, dww, nb, /*s0*/1, /*s1*/0,
+                                 /*p0*/pad, /*p1*/0, /*d0*/1, /*d1*/0,
+                                 /*is_2D*/false, GGML_TYPE_F32);
+            }
+            // mul_mat result r2 ne = [OW=T, 1, C, 1]; drop the unit ne1 -> [T, C, 1].
+            ggml_tensor* r2 = ggml_mul_mat(ctx, ic, dww);
+            ggml_tensor* item_dw = ggml_reshape_3d(ctx, r2, r2->ne[0], r2->ne[2], 1); // [T,C,1]
+            // reassemble along ne2 (batch). For B==1 there is no concat.
+            dw = (dw == nullptr) ? item_dw : ggml_concat(ctx, dw, item_dw, /*dim*/2);
         }
-        // mul_mat result r2 ne = [OW=T, 1, C, B]; drop the unit ne1 -> [T, C, B].
-        ggml_tensor* r2 = ggml_mul_mat(ctx, ic, dww);
-        dw = ggml_reshape_3d(ctx, r2, r2->ne[0], r2->ne[2], B); // [OW=T, C, B]
+        // dw is [OW=T, C, B].
     }
     ggml_tensor* dwb = clone_weight_opt(ctx, ml, pre + "conv.depthwise_conv.bias"); // [C]
     // transpose ne0<->ne1 (keep batch on ne2): [T,C,B] -> [C,T,B].
