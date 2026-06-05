@@ -1,0 +1,79 @@
+# parakeet.cpp UBI-based container image for OpenShift PoC.
+#
+# Multi-stage build:
+#   1. Builder stage: compile parakeet-cli with cmake on UBI
+#   2. Runtime stage: slim UBI-minimal with just the binary + libs + test audio
+#
+# CPU-only build (GGML_NATIVE=OFF for portability).
+#
+# Usage:
+#   podman build -t parakeet-cpp:ubi -f Dockerfile.ubi .
+#   podman run -v ./models:/models:ro parakeet-cpp:ubi --model /models/model.gguf /audio/clip.wav
+
+# ---------------------------------------------------------------------------
+# Builder stage: compile parakeet-cli
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi-minimal AS builder
+
+# Install build dependencies
+RUN microdnf install -y \
+        gcc-c++ \
+        cmake \
+        make \
+        git \
+        ca-certificates \
+    && microdnf clean all
+
+WORKDIR /src
+COPY . .
+
+# Initialize the ggml submodule (may be empty in shallow clones).
+# The CMake build calls scripts/apply_ggml_patches.sh which needs a git repo.
+RUN if [ ! -f third_party/ggml/CMakeLists.txt ]; then \
+        git submodule update --init --recursive third_party/ggml; \
+    fi \
+    && rm -rf third_party/ggml/.git \
+    && git -C third_party/ggml init -q
+
+# Build parakeet-cli (CPU, portable, no host-specific ISA extensions)
+RUN cmake -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_NATIVE=OFF \
+        -DPARAKEET_BUILD_CLI=ON \
+        -DPARAKEET_BUILD_TESTS=OFF \
+    && cmake --build build -j"$(nproc)"
+
+# Stage the binary and shared libraries into a clean prefix
+RUN mkdir -p /install/bin /install/lib \
+    && cp build/examples/cli/parakeet-cli /install/bin/ \
+    && find build -name '*.so*' -exec cp -av {} /install/lib/ \;
+
+# ---------------------------------------------------------------------------
+# Runtime stage: slim image with binary, libs, and test audio
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi-minimal
+
+# Install runtime dependency (OpenMP for parallel inference)
+RUN microdnf install -y libgomp && microdnf clean all
+
+# Copy built binary and shared libraries
+COPY --from=builder /install/bin/ /usr/local/bin/
+COPY --from=builder /install/lib/ /usr/local/lib/
+RUN ldconfig /usr/local/lib
+
+# Copy test audio fixtures for self-contained testing
+COPY tests/fixtures/*.wav /audio/
+
+# Create model mount point
+RUN mkdir -p /models
+
+# OpenShift compatibility: group 0 permissions for arbitrary UID
+WORKDIR /opt/app-root/src
+RUN chgrp -R 0 /opt/app-root /models /audio /usr/local/bin/parakeet-cli \
+    && chmod -R g=u /opt/app-root /models /audio
+
+# Non-root user for OpenShift
+USER 1001
+
+ENTRYPOINT ["parakeet-cli"]
+CMD ["--help"]
