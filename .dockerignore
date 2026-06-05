@@ -1,10 +1,6 @@
-.git
-*.md
-LICENSE
 kubernetes/
 poc-plan.md
-docs/
-benchmarks/plots/
-benchmarks/media/
 .autopoc/
 .github/
+benchmarks/plots/
+benchmarks/media/

@@ -27,13 +27,15 @@ RUN microdnf install -y \
 WORKDIR /src
 COPY . .
 
-# Initialize the ggml submodule (may be empty in shallow clones).
+# Clone the ggml dependency (submodule may be empty in shallow/binary builds).
 # The CMake build calls scripts/apply_ggml_patches.sh which needs a git repo.
 RUN if [ ! -f third_party/ggml/CMakeLists.txt ]; then \
-        git submodule update --init --recursive third_party/ggml; \
-    fi \
-    && rm -rf third_party/ggml/.git \
-    && git -C third_party/ggml init -q
+        rm -rf third_party/ggml && \
+        git clone --depth=1 https://github.com/ggml-org/ggml.git third_party/ggml; \
+    else \
+        rm -rf third_party/ggml/.git && \
+        git -C third_party/ggml init -q; \
+    fi
 
 # Build parakeet-cli (CPU, portable, no host-specific ISA extensions)
 RUN cmake -B build \
