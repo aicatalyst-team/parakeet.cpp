@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: parakeet-json-output-test
+  namespace: poc-parakeet-cpp
+  labels:
+    app: parakeet-cpp
+    autopoc.io/project: parakeet-cpp
+    autopoc.io/phase: json-output-test
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 120
+  template:
+    metadata:
+      labels:
+        app: parakeet-cpp
+    spec:
+      containers:
+        - name: parakeet-cli
+          image: quay.io/aicatalyst/parakeet-cpp:latest
+          command: ["parakeet-cli"]
+          args:
+            - "--model"
+            - "/models/parakeet-ctc-110m-q8_0.gguf"
+            - "--json"
+            - "/audio/clip.wav"
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: parakeet-models
+      restartPolicy: Never

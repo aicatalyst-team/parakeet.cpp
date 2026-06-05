@@ -1,0 +1,35 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: parakeet-help-test
+  namespace: poc-parakeet-cpp
+  labels:
+    app: parakeet-cpp
+    autopoc.io/project: parakeet-cpp
+    autopoc.io/phase: help-output
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 30
+  template:
+    metadata:
+      labels:
+        app: parakeet-cpp
+    spec:
+      containers:
+        - name: parakeet-cli
+          image: quay.io/aicatalyst/parakeet-cpp:latest
+          command: ["parakeet-cli"]
+          args: ["--help"]
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      restartPolicy: Never
